@@ -1,7 +1,7 @@
 use iced::{
     Task,
     platform_specific::shell::commands::layer_surface::{
-        Anchor, KeyboardInteractivity, Layer, destroy_layer_surface, get_layer_surface, set_anchor,
+        Anchor, KeyboardInteractivity, Layer, destroy_layer_surface, get_layer_surface,
         set_exclusive_zone, set_keyboard_interactivity, set_size,
     },
     runtime::platform_specific::wayland::layer_surface::{IcedOutput, SctkLayerSurfaceSettings},
@@ -12,50 +12,35 @@ use wayland_client::protocol::wl_output::WlOutput;
 
 use crate::{
     HEIGHT,
-    config::{self, AppearanceStyle, Position},
+    config::{self, AppearanceStyle, BarConfig, Position},
     menu::{Menu, MenuType},
     position_button::ButtonUIRef,
 };
 
 #[derive(Debug, Clone)]
-struct ShellInfo {
-    id: Id,
-    position: Position,
-    style: AppearanceStyle,
-    menu: Menu,
-    scale_factor: f64,
+pub struct ShellInfo {
+    pub id: Id,
+    pub config: BarConfig,
+    pub menu: Menu,
+    pub scale_factor: f64,
 }
 
 #[derive(Debug, Clone)]
-pub struct Outputs(Vec<(String, Option<ShellInfo>, Option<WlOutput>)>);
+pub struct Outputs(Vec<(String, Vec<ShellInfo>, Option<WlOutput>)>);
 
 pub enum HasOutput<'a> {
-    Main,
+    Main(&'a ShellInfo),
     Menu(Option<&'a (MenuType, ButtonUIRef)>),
 }
 
 impl Outputs {
     pub fn new<Message: 'static>(
-        style: AppearanceStyle,
-        position: Position,
+        bar_configs: Vec<BarConfig>,
         scale_factor: f64,
     ) -> (Self, Task<Message>) {
-        let (id, menu_id, task) = Self::create_output_layers(style, None, position, scale_factor);
+        let (infos, task) = Self::create_output_layers(None, bar_configs, scale_factor);
 
-        (
-            Self(vec![(
-                "Fallback".to_string(),
-                Some(ShellInfo {
-                    id,
-                    menu: Menu::new(menu_id),
-                    position,
-                    style,
-                    scale_factor,
-                }),
-                None,
-            )]),
-            task,
-        )
+        (Self(vec![("Fallback".to_string(), infos, None)]), task)
     }
 
     fn get_height(style: AppearanceStyle, scale_factor: f64) -> f64 {
@@ -68,47 +53,63 @@ impl Outputs {
     }
 
     fn create_output_layers<Message: 'static>(
-        style: AppearanceStyle,
         wl_output: Option<WlOutput>,
-        position: Position,
+        bar_configs: Vec<BarConfig>,
         scale_factor: f64,
-    ) -> (Id, Id, Task<Message>) {
-        let id = Id::unique();
-        let height = Self::get_height(style, scale_factor);
+    ) -> (Vec<ShellInfo>, Task<Message>) {
+        let mut infos = Vec::new();
+        let mut tasks = Vec::new();
 
-        let task = get_layer_surface(SctkLayerSurfaceSettings {
-            id,
-            namespace: "ashell-main-layer".to_string(),
-            size: Some((None, Some(height as u32))),
-            layer: Layer::Bottom,
-            keyboard_interactivity: KeyboardInteractivity::None,
-            exclusive_zone: height as i32,
-            output: wl_output.clone().map_or(IcedOutput::Active, |wl_output| {
-                IcedOutput::Output(wl_output)
-            }),
-            anchor: match position {
-                Position::Top => Anchor::TOP,
-                Position::Bottom => Anchor::BOTTOM,
-            } | Anchor::LEFT
-                | Anchor::RIGHT,
-            ..Default::default()
-        });
+        for config in bar_configs {
+            let id = Id::unique();
+            let style = config
+                .appearance
+                .as_ref()
+                .map(|a| a.style)
+                .unwrap_or(AppearanceStyle::default());
+            let height = Self::get_height(style, scale_factor);
 
-        let menu_id = Id::unique();
-        let menu_task = get_layer_surface(SctkLayerSurfaceSettings {
-            id: menu_id,
-            namespace: "ashell-main-layer".to_string(),
-            size: Some((None, None)),
-            layer: Layer::Background,
-            keyboard_interactivity: KeyboardInteractivity::None,
-            output: wl_output.map_or(IcedOutput::Active, |wl_output| {
-                IcedOutput::Output(wl_output)
-            }),
-            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            ..Default::default()
-        });
+            tasks.push(get_layer_surface(SctkLayerSurfaceSettings {
+                id,
+                namespace: "ashell-main-layer".to_string(),
+                size: Some((None, Some(height as u32))),
+                layer: Layer::Bottom,
+                keyboard_interactivity: KeyboardInteractivity::None,
+                exclusive_zone: height as i32,
+                output: wl_output.clone().map_or(IcedOutput::Active, |wl_output| {
+                    IcedOutput::Output(wl_output)
+                }),
+                anchor: match config.position {
+                    Position::Top => Anchor::TOP,
+                    Position::Bottom => Anchor::BOTTOM,
+                } | Anchor::LEFT
+                    | Anchor::RIGHT,
+                ..Default::default()
+            }));
 
-        (id, menu_id, Task::batch(vec![task, menu_task]))
+            let menu_id = Id::unique();
+            tasks.push(get_layer_surface(SctkLayerSurfaceSettings {
+                id: menu_id,
+                namespace: "ashell-main-layer".to_string(),
+                size: Some((None, None)),
+                layer: Layer::Background,
+                keyboard_interactivity: KeyboardInteractivity::None,
+                output: wl_output.clone().map_or(IcedOutput::Active, |wl_output| {
+                    IcedOutput::Output(wl_output)
+                }),
+                anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                ..Default::default()
+            }));
+
+            infos.push(ShellInfo {
+                id,
+                menu: Menu::new(menu_id),
+                config,
+                scale_factor,
+            });
+        }
+
+        (infos, Task::batch(tasks))
     }
 
     fn name_in_config(name: &str, outputs: &config::Outputs) -> bool {
@@ -122,10 +123,10 @@ impl Outputs {
     }
 
     pub fn has(&'_ self, id: Id) -> Option<HasOutput<'_>> {
-        self.0.iter().find_map(|(_, info, _)| {
-            info.as_ref().and_then(|info| {
+        self.0.iter().find_map(|(_, infos, _)| {
+            infos.iter().find_map(|info| {
                 if info.id == id {
-                    Some(HasOutput::Main)
+                    Some(HasOutput::Main(info))
                 } else if info.menu.id == id {
                     Some(HasOutput::Menu(info.menu.menu_info.as_ref()))
                 } else {
@@ -136,8 +137,8 @@ impl Outputs {
     }
 
     pub fn get_monitor_name(&self, id: Id) -> Option<&str> {
-        self.0.iter().find_map(|(name, info, _)| {
-            info.as_ref().and_then(|info| {
+        self.0.iter().find_map(|(name, infos, _)| {
+            infos.iter().find_map(|info| {
                 if info.id == id {
                     Some(name.as_str())
                 } else {
@@ -150,15 +151,14 @@ impl Outputs {
     pub fn has_name(&self, name: &str) -> bool {
         self.0
             .iter()
-            .any(|(n, info, _)| info.is_some() && n.as_str().contains(name))
+            .any(|(n, infos, _)| !infos.is_empty() && n.as_str().contains(name))
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn add<Message: 'static>(
         &mut self,
-        style: AppearanceStyle,
+        bar_configs: Vec<BarConfig>,
         request_outputs: &config::Outputs,
-        position: Position,
         name: &str,
         wl_output: WlOutput,
         scale_factor: f64,
@@ -168,65 +168,44 @@ impl Outputs {
         if target {
             debug!("Found target output, creating a new layer surface");
 
-            let (id, menu_id, task) =
-                Self::create_output_layers(style, Some(wl_output.clone()), position, scale_factor);
+            let (infos, task) =
+                Self::create_output_layers(Some(wl_output.clone()), bar_configs, scale_factor);
 
             let destroy_task = match self.0.iter().position(|(key, _, _)| key.as_str() == name) {
                 Some(index) => {
                     let old_output = self.0.swap_remove(index);
+                    let mut destroy_tasks = Vec::new();
 
-                    match old_output.1 {
-                        Some(shell_info) => {
-                            let destroy_main_task = destroy_layer_surface(shell_info.id);
-                            let destroy_menu_task = destroy_layer_surface(shell_info.menu.id);
-
-                            Task::batch(vec![destroy_main_task, destroy_menu_task])
-                        }
-                        _ => Task::none(),
+                    for shell_info in old_output.1 {
+                        destroy_tasks.push(destroy_layer_surface(shell_info.id));
+                        destroy_tasks.push(destroy_layer_surface(shell_info.menu.id));
                     }
+                    Task::batch(destroy_tasks)
                 }
                 _ => Task::none(),
             };
 
-            self.0.push((
-                name.to_owned(),
-                Some(ShellInfo {
-                    id,
-                    menu: Menu::new(menu_id),
-                    position,
-                    style,
-                    scale_factor,
-                }),
-                Some(wl_output),
-            ));
+            self.0.push((name.to_owned(), infos, Some(wl_output)));
 
             // remove fallback layer surface
             let destroy_fallback_task =
                 match self.0.iter().position(|(_, _, output)| output.is_none()) {
                     Some(index) => {
                         let old_output = self.0.swap_remove(index);
+                        let mut destroy_tasks = Vec::new();
 
-                        match old_output.1 {
-                            Some(shell_info) => {
-                                let destroy_fallback_main_task =
-                                    destroy_layer_surface(shell_info.id);
-                                let destroy_fallback_menu_task =
-                                    destroy_layer_surface(shell_info.menu.id);
-
-                                Task::batch(vec![
-                                    destroy_fallback_main_task,
-                                    destroy_fallback_menu_task,
-                                ])
-                            }
-                            _ => Task::none(),
+                        for shell_info in old_output.1 {
+                            destroy_tasks.push(destroy_layer_surface(shell_info.id));
+                            destroy_tasks.push(destroy_layer_surface(shell_info.menu.id));
                         }
+                        Task::batch(destroy_tasks)
                     }
                     _ => Task::none(),
                 };
 
             Task::batch(vec![destroy_task, destroy_fallback_task, task])
         } else {
-            self.0.push((name.to_owned(), None, Some(wl_output)));
+            self.0.push((name.to_owned(), Vec::new(), Some(wl_output)));
 
             Task::none()
         }
@@ -234,8 +213,7 @@ impl Outputs {
 
     pub fn remove<Message: 'static>(
         &mut self,
-        style: AppearanceStyle,
-        position: Position,
+        bar_configs: Vec<BarConfig>,
         wl_output: WlOutput,
         scale_factor: f64,
     ) -> Task<Message> {
@@ -247,38 +225,25 @@ impl Outputs {
             Some(index_to_remove) => {
                 debug!("Removing layer surface for output");
 
-                let (name, shell_info, wl_output) = self.0.swap_remove(index_to_remove);
+                let (name, infos, wl_output) = self.0.swap_remove(index_to_remove);
 
-                let destroy_task = if let Some(shell_info) = shell_info {
-                    let destroy_main_task = destroy_layer_surface(shell_info.id);
-                    let destroy_menu_task = destroy_layer_surface(shell_info.menu.id);
+                let mut destroy_tasks = Vec::new();
+                for shell_info in infos {
+                    destroy_tasks.push(destroy_layer_surface(shell_info.id));
+                    destroy_tasks.push(destroy_layer_surface(shell_info.menu.id));
+                }
+                let destroy_task = Task::batch(destroy_tasks);
 
-                    Task::batch(vec![destroy_main_task, destroy_menu_task])
-                } else {
-                    Task::none()
-                };
+                self.0.push((name, Vec::new(), wl_output));
 
-                self.0.push((name, None, wl_output));
-
-                if self.0.iter().any(|(_, shell_info, _)| shell_info.is_some()) {
+                if self.0.iter().any(|(_, infos, _)| !infos.is_empty()) {
                     Task::batch(vec![destroy_task])
                 } else {
                     debug!("No outputs left, creating a fallback layer surface");
 
-                    let (id, menu_id, task) =
-                        Self::create_output_layers(style, None, position, scale_factor);
+                    let (infos, task) = Self::create_output_layers(None, bar_configs, scale_factor);
 
-                    self.0.push((
-                        "Fallback".to_string(),
-                        Some(ShellInfo {
-                            id,
-                            menu: Menu::new(menu_id),
-                            position,
-                            style,
-                            scale_factor,
-                        }),
-                        None,
-                    ));
+                    self.0.push(("Fallback".to_string(), infos, None));
 
                     Task::batch(vec![destroy_task, task])
                 }
@@ -289,9 +254,8 @@ impl Outputs {
 
     pub fn sync<Message: 'static>(
         &mut self,
-        style: AppearanceStyle,
+        bar_configs: Vec<BarConfig>,
         request_outputs: &config::Outputs,
-        position: Position,
         scale_factor: f64,
     ) -> Task<Message> {
         debug!("Syncing outputs: {self:?}, request_outputs: {request_outputs:?}");
@@ -299,8 +263,8 @@ impl Outputs {
         let to_remove = self
             .0
             .iter()
-            .filter_map(|(name, shell_info, wl_output)| {
-                if !Self::name_in_config(name, request_outputs) && shell_info.is_some() {
+            .filter_map(|(name, infos, wl_output)| {
+                if !Self::name_in_config(name, request_outputs) && !infos.is_empty() {
                     Some(wl_output.clone())
                 } else {
                     None
@@ -313,8 +277,8 @@ impl Outputs {
         let to_add = self
             .0
             .iter()
-            .filter_map(|(name, shell_info, wl_output)| {
-                if Self::name_in_config(name, request_outputs) && shell_info.is_none() {
+            .filter_map(|(name, infos, wl_output)| {
+                if Self::name_in_config(name, request_outputs) && infos.is_empty() {
                     Some((name.clone(), wl_output.clone()))
                 } else {
                     None
@@ -328,9 +292,8 @@ impl Outputs {
         for (name, wl_output) in to_add {
             if let Some(wl_output) = wl_output {
                 tasks.push(self.add(
-                    style,
+                    bar_configs.clone(),
                     request_outputs,
-                    position,
                     name.as_str(),
                     wl_output,
                     scale_factor,
@@ -339,64 +302,56 @@ impl Outputs {
         }
 
         for wl_output in to_remove {
-            tasks.push(self.remove(style, position, wl_output, scale_factor));
+            tasks.push(self.remove(bar_configs.clone(), wl_output, scale_factor));
         }
 
-        for shell_info in self.0.iter_mut().filter_map(|(_, shell_info, _)| {
-            if let Some(shell_info) = shell_info
-                && shell_info.position != position
-            {
-                Some(shell_info)
-            } else {
-                None
+        // Handle style or scale_factor changes for existing bars
+        for (_, infos, _) in self.0.iter_mut() {
+            // If the number of bars changed, we might need a full recreate, but for now let's sync existing ones
+            // This is a simple implementation that might need more complexity for dynamic bar addition/removal
+            for (i, shell_info) in infos.iter_mut().enumerate() {
+                if let Some(config) = bar_configs.get(i) {
+                    let style = config
+                        .appearance
+                        .as_ref()
+                        .map(|a| a.style)
+                        .unwrap_or(AppearanceStyle::default());
+                    if shell_info.config != *config || shell_info.scale_factor != scale_factor {
+                        debug!(
+                            "Change bar config or scale_factor for output: {:?}, new style {:?}, new scale_factor {:?}",
+                            shell_info.id, style, scale_factor
+                        );
+                        shell_info.config = config.clone();
+                        shell_info.scale_factor = scale_factor;
+                        let height = Self::get_height(style, scale_factor);
+                        tasks.push(Task::batch(vec![
+                            set_size(shell_info.id, None, Some(height as u32)),
+                            set_exclusive_zone(shell_info.id, height as i32),
+                        ]));
+                    }
+                }
             }
-        }) {
-            debug!(
-                "Repositioning output: {:?}, new position {:?}",
-                shell_info.id, position
-            );
-            shell_info.position = position;
-            tasks.push(set_anchor(
-                shell_info.id,
-                match position {
-                    Position::Top => Anchor::TOP,
-                    Position::Bottom => Anchor::BOTTOM,
-                } | Anchor::LEFT
-                    | Anchor::RIGHT,
-            ));
-        }
-
-        for shell_info in self.0.iter_mut().filter_map(|(_, shell_info, _)| {
-            if let Some(shell_info) = shell_info
-                && (shell_info.style != style || shell_info.scale_factor != scale_factor)
-            {
-                Some(shell_info)
-            } else {
-                None
-            }
-        }) {
-            debug!(
-                "Change style or scale_factor for output: {:?}, new style {:?}, new scale_factor {:?}",
-                shell_info.id, style, scale_factor
-            );
-            shell_info.style = style;
-            shell_info.scale_factor = scale_factor;
-            let height = Self::get_height(style, scale_factor);
-            tasks.push(Task::batch(vec![
-                set_size(shell_info.id, None, Some(height as u32)),
-                set_exclusive_zone(shell_info.id, height as i32),
-            ]));
         }
 
         Task::batch(tasks)
     }
 
+    pub fn get_bar_config(&self, id: Id) -> Option<BarConfig> {
+        for (_, infos, _) in self.0.iter() {
+            for shell_info in infos {
+                if shell_info.id == id || shell_info.menu.id == id {
+                    return Some(shell_info.config.clone());
+                }
+            }
+        }
+        None
+    }
+
     pub fn menu_is_open(&self) -> bool {
-        self.0.iter().any(|(_, shell_info, _)| {
-            shell_info
-                .as_ref()
-                .map(|shell_info| shell_info.menu.menu_info.is_some())
-                .unwrap_or_default()
+        self.0.iter().any(|(_, infos, _)| {
+            infos
+                .iter()
+                .any(|shell_info| shell_info.menu.menu_info.is_some())
         })
     }
 
@@ -407,48 +362,41 @@ impl Outputs {
         button_ui_ref: ButtonUIRef,
         request_keyboard: bool,
     ) -> Task<Message> {
-        let task = match self.0.iter_mut().find(|(_, shell_info, _)| {
-            shell_info.as_ref().map(|shell_info| shell_info.id) == Some(id)
-                || shell_info.as_ref().map(|shell_info| shell_info.menu.id) == Some(id)
-        }) {
-            Some((_, Some(shell_info), _)) => {
-                let toggle_task =
-                    shell_info
-                        .menu
-                        .toggle(menu_type, button_ui_ref, request_keyboard);
-                let mut tasks = self
-                    .0
-                    .iter_mut()
-                    .filter_map(|(_, shell_info, _)| {
-                        if let Some(shell_info) = shell_info {
-                            if shell_info.id != id && shell_info.menu.id != id {
-                                Some(shell_info.menu.close())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                tasks.push(toggle_task);
+        let mut tasks = Vec::new();
+        let mut target_id = None;
 
-                Task::batch(tasks)
+        for (_, infos, _) in self.0.iter_mut() {
+            for shell_info in infos.iter_mut() {
+                if shell_info.id == id || shell_info.menu.id == id {
+                    target_id = Some(shell_info.id);
+                    tasks.push(shell_info.menu.toggle(
+                        menu_type.clone(),
+                        button_ui_ref,
+                        request_keyboard,
+                    ));
+                } else {
+                    tasks.push(shell_info.menu.close());
+                }
             }
-            _ => Task::none(),
-        };
+        }
+
+        let task = Task::batch(tasks);
 
         if request_keyboard {
-            if self.menu_is_open() {
-                Task::batch(vec![
-                    task,
-                    set_keyboard_interactivity(id, KeyboardInteractivity::OnDemand),
-                ])
+            if let Some(id) = target_id {
+                if self.menu_is_open() {
+                    Task::batch(vec![
+                        task,
+                        set_keyboard_interactivity(id, KeyboardInteractivity::OnDemand),
+                    ])
+                } else {
+                    Task::batch(vec![
+                        task,
+                        set_keyboard_interactivity(id, KeyboardInteractivity::None),
+                    ])
+                }
             } else {
-                Task::batch(vec![
-                    task,
-                    set_keyboard_interactivity(id, KeyboardInteractivity::None),
-                ])
+                task
             }
         } else {
             task
@@ -460,13 +408,14 @@ impl Outputs {
         id: Id,
         esc_button_enabled: bool,
     ) -> Task<Message> {
-        let task = match self.0.iter_mut().find(|(_, shell_info, _)| {
-            shell_info.as_ref().map(|shell_info| shell_info.id) == Some(id)
-                || shell_info.as_ref().map(|shell_info| shell_info.menu.id) == Some(id)
-        }) {
-            Some((_, Some(shell_info), _)) => shell_info.menu.close(),
-            _ => Task::none(),
-        };
+        let mut task = Task::none();
+        for (_, infos, _) in self.0.iter_mut() {
+            for shell_info in infos.iter_mut() {
+                if shell_info.id == id || shell_info.menu.id == id {
+                    task = shell_info.menu.close();
+                }
+            }
+        }
 
         if esc_button_enabled && !self.menu_is_open() {
             Task::batch(vec![
@@ -484,13 +433,14 @@ impl Outputs {
         menu_type: MenuType,
         esc_button_enabled: bool,
     ) -> Task<Message> {
-        let task = match self.0.iter_mut().find(|(_, shell_info, _)| {
-            shell_info.as_ref().map(|shell_info| shell_info.id) == Some(id)
-                || shell_info.as_ref().map(|shell_info| shell_info.menu.id) == Some(id)
-        }) {
-            Some((_, Some(shell_info), _)) => shell_info.menu.close_if(menu_type),
-            _ => Task::none(),
-        };
+        let mut task = Task::none();
+        for (_, infos, _) in self.0.iter_mut() {
+            for shell_info in infos.iter_mut() {
+                if shell_info.id == id || shell_info.menu.id == id {
+                    task = shell_info.menu.close_if(menu_type.clone());
+                }
+            }
+        }
 
         if esc_button_enabled && !self.menu_is_open() {
             Task::batch(vec![
@@ -507,29 +457,24 @@ impl Outputs {
         menu_type: MenuType,
         esc_button_enabled: bool,
     ) -> Task<Message> {
-        let task = Task::batch(
-            self.0
-                .iter_mut()
-                .map(|(_, shell_info, _)| {
-                    if let Some(shell_info) = shell_info {
-                        shell_info.menu.close_if(menu_type.clone())
-                    } else {
-                        Task::none()
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
+        let mut tasks = Vec::new();
+        for (_, infos, _) in self.0.iter_mut() {
+            for shell_info in infos.iter_mut() {
+                tasks.push(shell_info.menu.close_if(menu_type.clone()));
+            }
+        }
+        let task = Task::batch(tasks);
 
         if esc_button_enabled && !self.menu_is_open() {
-            let keyboard_tasks = self
-                .0
-                .iter()
-                .map(|(_, shell_info, _)| {
-                    shell_info.as_ref().map_or_else(Task::none, |shell_info| {
-                        set_keyboard_interactivity(shell_info.id, KeyboardInteractivity::None)
-                    })
-                })
-                .collect::<Vec<_>>();
+            let mut keyboard_tasks = Vec::new();
+            for (_, infos, _) in self.0.iter() {
+                for shell_info in infos {
+                    keyboard_tasks.push(set_keyboard_interactivity(
+                        shell_info.id,
+                        KeyboardInteractivity::None,
+                    ));
+                }
+            }
             Task::batch(vec![task, Task::batch(keyboard_tasks)])
         } else {
             task
@@ -537,33 +482,26 @@ impl Outputs {
     }
 
     pub fn close_all_menus<Message: 'static>(&mut self, esc_button_enabled: bool) -> Task<Message> {
-        let task = Task::batch(
-            self.0
-                .iter_mut()
-                .map(|(_, shell_info, _)| {
-                    if let Some(shell_info) = shell_info {
-                        if shell_info.menu.menu_info.is_some() {
-                            shell_info.menu.close()
-                        } else {
-                            Task::none()
-                        }
-                    } else {
-                        Task::none()
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
+        let mut tasks = Vec::new();
+        for (_, infos, _) in self.0.iter_mut() {
+            for shell_info in infos.iter_mut() {
+                if shell_info.menu.menu_info.is_some() {
+                    tasks.push(shell_info.menu.close());
+                }
+            }
+        }
+        let task = Task::batch(tasks);
 
         if esc_button_enabled && !self.menu_is_open() {
-            let keyboard_tasks = self
-                .0
-                .iter()
-                .map(|(_, shell_info, _)| {
-                    shell_info.as_ref().map_or_else(Task::none, |shell_info| {
-                        set_keyboard_interactivity(shell_info.id, KeyboardInteractivity::None)
-                    })
-                })
-                .collect::<Vec<_>>();
+            let mut keyboard_tasks = Vec::new();
+            for (_, infos, _) in self.0.iter() {
+                for shell_info in infos {
+                    keyboard_tasks.push(set_keyboard_interactivity(
+                        shell_info.id,
+                        KeyboardInteractivity::None,
+                    ));
+                }
+            }
             Task::batch(vec![task, Task::batch(keyboard_tasks)])
         } else {
             task
@@ -571,22 +509,24 @@ impl Outputs {
     }
 
     pub fn request_keyboard<Message: 'static>(&self, id: Id) -> Task<Message> {
-        match self.0.iter().find(|(_, shell_info, _)| {
-            shell_info.as_ref().map(|shell_info| shell_info.id) == Some(id)
-                || shell_info.as_ref().map(|shell_info| shell_info.menu.id) == Some(id)
-        }) {
-            Some((_, Some(shell_info), _)) => shell_info.menu.request_keyboard(),
-            _ => Task::none(),
+        for (_, infos, _) in self.0.iter() {
+            for shell_info in infos {
+                if shell_info.id == id || shell_info.menu.id == id {
+                    return shell_info.menu.request_keyboard();
+                }
+            }
         }
+        Task::none()
     }
 
     pub fn release_keyboard<Message: 'static>(&self, id: Id) -> Task<Message> {
-        match self.0.iter().find(|(_, shell_info, _)| {
-            shell_info.as_ref().map(|shell_info| shell_info.id) == Some(id)
-                || shell_info.as_ref().map(|shell_info| shell_info.menu.id) == Some(id)
-        }) {
-            Some((_, Some(shell_info), _)) => shell_info.menu.release_keyboard(),
-            _ => Task::none(),
+        for (_, infos, _) in self.0.iter() {
+            for shell_info in infos {
+                if shell_info.id == id || shell_info.menu.id == id {
+                    return shell_info.menu.release_keyboard();
+                }
+            }
         }
+        Task::none()
     }
 }

@@ -14,6 +14,9 @@ allowing flexible layout configuration.
 
 Modules can be used on their own or organized into groups.
 
+This structure applies to both the global `[modules]` configuration (used as a default)
+and the `[bar.modules]` section for specific bars.
+
 ### Default configuration
 
 ```toml

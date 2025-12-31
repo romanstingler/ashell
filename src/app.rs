@@ -1,6 +1,6 @@
 use crate::{
     HEIGHT, centerbox,
-    config::{self, AppearanceStyle, Config, Modules, Position},
+    config::{self, AppearanceStyle, BarConfig, Config, ModuleDef, Modules, Position},
     get_log_spec,
     menu::{MenuSize, MenuType},
     modules::{
@@ -42,9 +42,9 @@ use std::{collections::HashMap, f32::consts::PI, path::PathBuf};
 use wayland_client::protocol::wl_output::WlOutput;
 
 pub struct GeneralConfig {
-    outputs: config::Outputs,
+    pub config: Config,
     pub modules: Modules,
-    enable_esc_key: bool,
+    pub enable_esc_key: bool,
 }
 
 pub struct App {
@@ -98,11 +98,8 @@ impl App {
         (logger, config, config_path): (LoggerHandle, Config, PathBuf),
     ) -> impl FnOnce() -> (Self, Task<Message>) {
         move || {
-            let (outputs, task) = Outputs::new(
-                config.appearance.style,
-                config.position,
-                config.appearance.scale_factor,
-            );
+            let (outputs, task) =
+                Outputs::new(config.get_bar_configs(), config.appearance.scale_factor);
 
             let custom = config
                 .custom_modules
@@ -117,9 +114,9 @@ impl App {
                     theme: AshellTheme::new(config.position, &config.appearance),
                     logger,
                     general_config: GeneralConfig {
-                        outputs: config.outputs,
-                        modules: config.modules,
+                        modules: config.modules.clone(),
                         enable_esc_key: config.enable_esc_key,
+                        config: config.clone(),
                     },
                     outputs,
                     app_launcher: config.app_launcher_cmd.map(AppLauncher::new),
@@ -144,9 +141,9 @@ impl App {
 
     fn refesh_config(&mut self, config: Box<Config>) {
         self.general_config = GeneralConfig {
-            outputs: config.outputs,
-            modules: config.modules,
+            modules: config.modules.clone(),
             enable_esc_key: config.enable_esc_key,
+            config: *config.clone(),
         };
         self.theme = AshellTheme::new(config.position, &config.appearance);
         let custom = config
@@ -220,18 +217,18 @@ impl App {
                 let mut tasks = Vec::new();
                 info!(
                     "Current outputs: {:?}, new outputs: {:?}",
-                    self.general_config.outputs, config.outputs
+                    self.general_config.config.outputs, config.outputs
                 );
-                if self.general_config.outputs != config.outputs
+                if self.general_config.config.outputs != config.outputs
+                    || self.general_config.config.get_bar_configs() != config.get_bar_configs()
                     || self.theme.bar_position != config.position
                     || self.theme.bar_style != config.appearance.style
                     || self.theme.scale_factor != config.appearance.scale_factor
                 {
                     warn!("Outputs changed, syncing");
                     tasks.push(self.outputs.sync(
-                        config.appearance.style,
+                        config.get_bar_configs(),
                         &config.outputs,
-                        config.position,
                         config.appearance.scale_factor,
                     ));
                 }
@@ -386,9 +383,8 @@ impl App {
                         .unwrap_or("");
 
                     self.outputs.add(
-                        self.theme.bar_style,
-                        &self.general_config.outputs,
-                        self.theme.bar_position,
+                        self.general_config.config.get_bar_configs(),
+                        &self.general_config.config.outputs,
                         name,
                         wl_output,
                         self.theme.scale_factor,
@@ -397,8 +393,7 @@ impl App {
                 iced::event::wayland::OutputEvent::Removed => {
                     info!("Output destroyed");
                     self.outputs.remove(
-                        self.theme.bar_style,
-                        self.theme.bar_position,
+                        self.general_config.config.get_bar_configs(),
                         wl_output,
                         self.theme.scale_factor,
                     )
@@ -422,26 +417,33 @@ impl App {
 
     pub fn view(&'_ self, id: Id) -> Element<'_, Message> {
         match self.outputs.has(id) {
-            Some(HasOutput::Main) => {
-                let [left, center, right] = self.modules_section(id, &self.theme);
+            Some(HasOutput::Main(shell_info)) => {
+                let [left, center, right] =
+                    self.modules_section_for_bar(id, &self.theme, &shell_info.config);
+                let style = shell_info
+                    .config
+                    .appearance
+                    .as_ref()
+                    .map(|a| a.style)
+                    .unwrap_or(self.theme.bar_style);
 
                 let centerbox = centerbox::Centerbox::new([left, center, right])
                     .spacing(self.theme.space.xxs)
                     .width(Length::Fill)
                     .align_items(Alignment::Center)
-                    .height(if self.theme.bar_style == AppearanceStyle::Islands {
+                    .height(if style == AppearanceStyle::Islands {
                         HEIGHT
                     } else {
                         HEIGHT - 8.
                     } as f32)
-                    .padding(if self.theme.bar_style == AppearanceStyle::Islands {
+                    .padding(if style == AppearanceStyle::Islands {
                         [self.theme.space.xxs, self.theme.space.xxs]
                     } else {
                         [0, 0]
                     });
 
-                let status_bar = container(centerbox).style(|t: &Theme| container::Style {
-                    background: match self.theme.bar_style {
+                let status_bar = container(centerbox).style(move |t: &Theme| container::Style {
+                    background: match style {
                         AppearanceStyle::Gradient => Some({
                             let start_color =
                                 t.palette().background.scale_alpha(self.theme.opacity);
@@ -462,14 +464,14 @@ impl App {
                                 Linear::new(Radians(PI))
                                     .add_stop(
                                         0.0,
-                                        match self.theme.bar_position {
+                                        match shell_info.config.position {
                                             Position::Top => start_color,
                                             Position::Bottom => end_color,
                                         },
                                     )
                                     .add_stop(
                                         1.0,
-                                        match self.theme.bar_position {
+                                        match shell_info.config.position {
                                             Position::Top => end_color,
                                             Position::Bottom => start_color,
                                         },
@@ -508,57 +510,113 @@ impl App {
             Some(HasOutput::Menu(menu_info)) => match menu_info {
                 Some((MenuType::Updates, button_ui_ref)) => {
                     if let Some(updates) = self.updates.as_ref() {
+                        let position = self.get_bar_position(id).unwrap_or(self.theme.bar_position);
                         self.menu_wrapper(
                             id,
                             updates.menu_view(id, &self.theme).map(Message::Updates),
                             MenuSize::Small,
                             *button_ui_ref,
+                            position,
                         )
                     } else {
                         Row::new().into()
                     }
                 }
-                Some((MenuType::Tray(name), button_ui_ref)) => self.menu_wrapper(
-                    id,
-                    self.tray.menu_view(&self.theme, name).map(Message::Tray),
-                    MenuSize::Medium,
-                    *button_ui_ref,
-                ),
-                Some((MenuType::Settings, button_ui_ref)) => self.menu_wrapper(
-                    id,
-                    self.settings
-                        .menu_view(id, &self.theme, self.theme.bar_position)
-                        .map(Message::Settings),
-                    MenuSize::Medium,
-                    *button_ui_ref,
-                ),
-                Some((MenuType::MediaPlayer, button_ui_ref)) => self.menu_wrapper(
-                    id,
-                    self.media_player
-                        .menu_view(&self.theme)
-                        .map(Message::MediaPlayer),
-                    MenuSize::Large,
-                    *button_ui_ref,
-                ),
-                Some((MenuType::SystemInfo, button_ui_ref)) => self.menu_wrapper(
-                    id,
-                    self.system_info
-                        .menu_view(&self.theme)
-                        .map(Message::SystemInfo),
-                    MenuSize::Medium,
-                    *button_ui_ref,
-                ),
+                Some((MenuType::Tray(name), button_ui_ref)) => {
+                    let position = self.get_bar_position(id).unwrap_or(self.theme.bar_position);
+                    self.menu_wrapper(
+                        id,
+                        self.tray.menu_view(&self.theme, name).map(Message::Tray),
+                        MenuSize::Medium,
+                        *button_ui_ref,
+                        position,
+                    )
+                }
+                Some((MenuType::Settings, button_ui_ref)) => {
+                    let position = self.get_bar_position(id).unwrap_or(self.theme.bar_position);
+                    self.menu_wrapper(
+                        id,
+                        self.settings
+                            .menu_view(id, &self.theme, position)
+                            .map(Message::Settings),
+                        MenuSize::Medium,
+                        *button_ui_ref,
+                        position,
+                    )
+                }
+                Some((MenuType::MediaPlayer, button_ui_ref)) => {
+                    let position = self.get_bar_position(id).unwrap_or(self.theme.bar_position);
+                    self.menu_wrapper(
+                        id,
+                        self.media_player
+                            .menu_view(&self.theme)
+                            .map(Message::MediaPlayer),
+                        MenuSize::Large,
+                        *button_ui_ref,
+                        position,
+                    )
+                }
+                Some((MenuType::SystemInfo, button_ui_ref)) => {
+                    let position = self.get_bar_position(id).unwrap_or(self.theme.bar_position);
+                    self.menu_wrapper(
+                        id,
+                        self.system_info
+                            .menu_view(&self.theme)
+                            .map(Message::SystemInfo),
+                        MenuSize::Medium,
+                        *button_ui_ref,
+                        position,
+                    )
+                }
                 None => Row::new().into(),
             },
             None => Row::new().into(),
         }
     }
 
+    fn modules_section_for_bar<'a>(
+        &'a self,
+        id: Id,
+        theme: &'a AshellTheme,
+        bar_config: &'a BarConfig,
+    ) -> [Element<'a, Message>; 3] {
+        let bar_modules = bar_config
+            .modules
+            .as_ref()
+            .unwrap_or(&self.general_config.modules);
+        [
+            self.modules_view(&bar_modules.left, id, theme),
+            self.modules_view(&bar_modules.center, id, theme),
+            self.modules_view(&bar_modules.right, id, theme),
+        ]
+    }
+
+    pub fn get_bar_position(&self, id: Id) -> Option<Position> {
+        self.outputs.get_bar_config(id).map(|c| c.position)
+    }
+
+    fn modules_view<'a>(
+        &'a self,
+        modules: &'a [ModuleDef],
+        id: Id,
+        theme: &'a AshellTheme,
+    ) -> Element<'a, Message> {
+        let mut row = Row::new()
+            .spacing(theme.space.xxs)
+            .align_y(Alignment::Center);
+
+        for module_def in modules {
+            row = row.push_maybe(match module_def {
+                ModuleDef::Single(module) => self.single_module_wrapper(id, theme, module),
+                ModuleDef::Group(group) => self.group_module_wrapper(id, theme, group),
+            });
+        }
+
+        row.into()
+    }
+
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch(vec![
-            Subscription::batch(self.modules_subscriptions(&self.general_config.modules.left)),
-            Subscription::batch(self.modules_subscriptions(&self.general_config.modules.center)),
-            Subscription::batch(self.modules_subscriptions(&self.general_config.modules.right)),
+        let mut subscriptions = vec![
             config::subscription(&self.config_path),
             listen_with(move |evt, _, _| match evt {
                 iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(
@@ -578,6 +636,24 @@ impl App {
                 }
                 _ => None,
             }),
-        ])
+        ];
+
+        for bar_config in self.general_config.config.get_bar_configs() {
+            let modules = bar_config
+                .modules
+                .as_ref()
+                .unwrap_or(&self.general_config.modules);
+            subscriptions.push(Subscription::batch(
+                self.modules_subscriptions(&modules.left),
+            ));
+            subscriptions.push(Subscription::batch(
+                self.modules_subscriptions(&modules.center),
+            ));
+            subscriptions.push(Subscription::batch(
+                self.modules_subscriptions(&modules.right),
+            ));
+        }
+
+        Subscription::batch(subscriptions)
     }
 }

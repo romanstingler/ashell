@@ -92,20 +92,56 @@ outputs = { Targets = ["DP-1", "eDP-1"] }
 
 ## Position
 
-You can set the position of the status bar to either `Top` or `Bottom`.
+You can set the default position of the status bar to either `Top` or `Bottom`.
+This will be used if no specific bars are configured using `[[bar]]`.
 
 ### Position Examples
 
-Set the bar position to the top:
+Set the default bar position to the top:
 
 ```toml
 position = "Top"
 ```
 
-Set the bar position to the bottom:
+Set the default bar position to the bottom:
 
 ```toml
 position = "Bottom"
+```
+
+## Multiple Bars
+
+Ashell supports defining multiple bars, each with its own position, appearance, and modules.
+This is done using the `[[bar]]` array of tables in your configuration.
+
+If you define any `[[bar]]` sections, the global `position` setting is ignored for those bars (each bar must specify its position),
+but global `modules` and `appearance` settings are used as defaults if not overridden within the bar configuration.
+
+:::info
+The `outputs` configuration is global. All configured bars will be rendered on the monitors specified by `outputs`.
+:::
+
+### Multi-Bar Example
+
+Create a top bar with "Islands" style and specific modules, and a bottom bar with "Solid" style using default modules:
+
+```toml
+# Top Bar
+[[bar]]
+position = "Top"
+[bar.appearance]
+style = "Islands"
+[bar.modules]
+left = ["Workspaces"]
+center = ["WindowTitle"]
+right = ["Clock", "Settings"]
+
+# Bottom Bar
+[[bar]]
+position = "Bottom"
+[bar.appearance]
+style = "Solid"
+# Uses global modules configuration if [bar.modules] is omitted
 ```
 
 ## Close menu with esc

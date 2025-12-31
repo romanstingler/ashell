@@ -135,6 +135,7 @@ impl App {
         content: Element<'a, app::Message>,
         menu_size: MenuSize,
         button_ui_ref: ButtonUIRef,
+        position: Position,
     ) -> Element<'a, app::Message> {
         mouse_area(
             container(
@@ -167,7 +168,7 @@ impl App {
                 )
                 .on_release(app::Message::None),
             )
-            .align_y(match self.theme.bar_position {
+            .align_y(match position {
                 Position::Top => Vertical::Top,
                 Position::Bottom => Vertical::Bottom,
             })
@@ -181,12 +182,12 @@ impl App {
                 };
 
                 Padding::new(0.)
-                    .top(if self.theme.bar_position == Position::Top {
+                    .top(if position == Position::Top {
                         v_padding
                     } else {
                         0
                     })
-                    .bottom(if self.theme.bar_position == Position::Bottom {
+                    .bottom(if position == Position::Bottom {
                         v_padding
                     } else {
                         0

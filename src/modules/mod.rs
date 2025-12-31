@@ -7,7 +7,7 @@ use crate::{
 };
 use iced::{
     Alignment, Border, Color, Element, Length, Subscription,
-    widget::{Row, container, row},
+    widget::{Row, container},
     window::Id,
 };
 
@@ -33,34 +33,6 @@ pub enum OnModulePress {
 }
 
 impl App {
-    pub fn modules_section<'a>(
-        &'a self,
-        id: Id,
-        theme: &'a AshellTheme,
-    ) -> [Element<'a, Message>; 3] {
-        [
-            &self.general_config.modules.left,
-            &self.general_config.modules.center,
-            &self.general_config.modules.right,
-        ]
-        .map(|modules_def| {
-            let mut row = row!()
-                .height(Length::Shrink)
-                .align_y(Alignment::Center)
-                .spacing(self.theme.space.xxs);
-
-            for module_def in modules_def {
-                row = row.push_maybe(match module_def {
-                    // life parsing of string to module
-                    ModuleDef::Single(module) => self.single_module_wrapper(id, theme, module),
-                    ModuleDef::Group(group) => self.group_module_wrapper(id, theme, group),
-                });
-            }
-
-            row.into()
-        })
-    }
-
     pub fn modules_subscriptions(&self, modules_def: &[ModuleDef]) -> Vec<Subscription<Message>> {
         modules_def
             .iter()
@@ -77,7 +49,7 @@ impl App {
             .collect()
     }
 
-    fn single_module_wrapper<'a>(
+    pub fn single_module_wrapper<'a>(
         &'a self,
         id: Id,
         theme: &'a AshellTheme,
@@ -138,7 +110,7 @@ impl App {
         })
     }
 
-    fn group_module_wrapper<'a>(
+    pub fn group_module_wrapper<'a>(
         &'a self,
         id: Id,
         theme: &'a AshellTheme,
@@ -306,7 +278,10 @@ impl App {
         }
     }
 
-    fn get_module_subscription(&self, module_name: &ModuleName) -> Option<Subscription<Message>> {
+    pub fn get_module_subscription(
+        &self,
+        module_name: &ModuleName,
+    ) -> Option<Subscription<Message>> {
         match module_name {
             ModuleName::AppLauncher => None,
             ModuleName::Custom(name) => self.custom.get(name).map(|custom| {

@@ -45,6 +45,8 @@ You can choose between:
 - `Solid`: The status bar has a solid background color.
 - `Gradient`: The status bar has a gradient background color.
 
+This setting can also be configured independently for each bar. See [Multiple Bars](../main.md#multiple-bars).
+
 ### Example
 
 ```toml

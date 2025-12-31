@@ -41,6 +41,49 @@ pub struct Config {
     pub media_player: MediaPlayerModuleConfig,
     pub keyboard_layout: KeyboardLayoutModuleConfig,
     pub enable_esc_key: bool,
+    #[serde(rename = "bar")]
+    pub bars: Vec<BarConfig>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BarConfig {
+    pub position: Position,
+    #[serde(default)]
+    pub modules: Option<Modules>,
+    #[serde(default)]
+    pub appearance: Option<BarAppearance>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BarAppearance {
+    pub style: AppearanceStyle,
+}
+
+impl Config {
+    pub fn get_bar_configs(&self) -> Vec<BarConfig> {
+        if self.bars.is_empty() {
+            vec![BarConfig {
+                position: self.position,
+                modules: Some(self.modules.clone()),
+                appearance: Some(BarAppearance {
+                    style: self.appearance.style,
+                }),
+            }]
+        } else {
+            self.bars
+                .iter()
+                .map(|bar| BarConfig {
+                    position: bar.position,
+                    modules: bar.modules.clone(),
+                    appearance: bar.appearance.clone().or_else(|| {
+                        Some(BarAppearance {
+                            style: self.appearance.style,
+                        })
+                    }),
+                })
+                .collect()
+        }
+    }
 }
 
 impl Default for Config {
@@ -63,6 +106,7 @@ impl Default for Config {
             keyboard_layout: KeyboardLayoutModuleConfig::default(),
             custom_modules: vec![],
             enable_esc_key: false,
+            bars: vec![],
         }
     }
 }
@@ -600,14 +644,14 @@ impl<'de> Deserialize<'de> for ModuleName {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ModuleDef {
     Single(ModuleName),
     Group(Vec<ModuleName>),
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Modules {
     #[serde(default)]
     pub left: Vec<ModuleDef>,
