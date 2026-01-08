@@ -89,6 +89,7 @@ pub struct AshellTheme {
     pub bar_position: Position,
     pub bar_style: AppearanceStyle,
     pub opacity: f32,
+    pub hover_opacity: f32,
     pub menu: MenuAppearance,
     pub workspace_colors: Vec<AppearanceColor>,
     pub special_workspace_colors: Option<Vec<AppearanceColor>>,
@@ -104,6 +105,7 @@ impl AshellTheme {
             bar_position: position,
             bar_style: appearance.style,
             opacity: appearance.opacity,
+            hover_opacity: appearance.hover_opacity,
             menu: appearance.menu,
             workspace_colors: appearance.workspace_colors.clone(),
             special_workspace_colors: appearance.special_workspace_colors.clone(),
@@ -237,7 +239,11 @@ impl AshellTheme {
                             .background
                             .weak
                             .color
-                            .scale_alpha(self.opacity)
+                            .scale_alpha(if self.opacity == 0.0 {
+                                self.hover_opacity
+                            } else {
+                                self.opacity
+                            })
                             .into(),
                     );
                     base
@@ -256,7 +262,11 @@ impl AshellTheme {
                         .background
                         .weak
                         .color
-                        .scale_alpha(self.opacity)
+                        .scale_alpha(if self.opacity == 0.0 {
+                            self.hover_opacity
+                        } else {
+                            self.opacity
+                        })
                         .into(),
                 ),
                 border: Border {
@@ -276,7 +286,11 @@ impl AshellTheme {
                             .background
                             .strong
                             .color
-                            .scale_alpha(self.opacity)
+                            .scale_alpha(if self.opacity == 0.0 {
+                                self.hover_opacity
+                            } else {
+                                self.opacity
+                            })
                             .into(),
                     );
                     base
@@ -295,7 +309,11 @@ impl AshellTheme {
                         .background
                         .weak
                         .color
-                        .scale_alpha(self.opacity)
+                        .scale_alpha(if self.opacity == 0.0 {
+                            self.hover_opacity
+                        } else {
+                            self.opacity
+                        })
                         .into(),
                 ),
                 border: Border {
@@ -315,7 +333,11 @@ impl AshellTheme {
                             .background
                             .strong
                             .color
-                            .scale_alpha(self.opacity)
+                            .scale_alpha(if self.opacity == 0.0 {
+                                self.hover_opacity
+                            } else {
+                                self.opacity
+                            })
                             .into(),
                     );
                     base
@@ -353,7 +375,11 @@ impl AshellTheme {
                             .background
                             .weak
                             .color
-                            .scale_alpha(self.opacity)
+                            .scale_alpha(if self.opacity == 0.0 {
+                                self.hover_opacity
+                            } else {
+                                self.opacity
+                            })
                             .into(),
                     );
                     base.text_color = theme.palette().text;
@@ -376,7 +402,11 @@ impl AshellTheme {
                     } else {
                         theme.extended_palette().background.weak.color
                     }
-                    .scale_alpha(self.opacity)
+                    .scale_alpha(if self.opacity == 0.0 {
+                        self.hover_opacity
+                    } else {
+                        self.opacity
+                    })
                     .into(),
                 ),
                 border: Border {
@@ -401,7 +431,11 @@ impl AshellTheme {
                         } else {
                             theme.extended_palette().background.strong.color
                         }
-                        .scale_alpha(self.opacity)
+                        .scale_alpha(if self.opacity == 0.0 {
+                            self.hover_opacity
+                        } else {
+                            self.opacity
+                        })
                         .into(),
                     );
                     base
@@ -548,7 +582,11 @@ impl AshellTheme {
                             .background
                             .weak
                             .color
-                            .scale_alpha(self.opacity)
+                            .scale_alpha(if self.opacity == 0.0 {
+                                self.hover_opacity
+                            } else {
+                                self.opacity
+                            })
                             .into(),
                     );
                     base
@@ -587,7 +625,11 @@ impl AshellTheme {
                             .background
                             .strong
                             .color
-                            .scale_alpha(self.opacity)
+                            .scale_alpha(if self.opacity == 0.0 {
+                                self.hover_opacity
+                            } else {
+                                self.opacity
+                            })
                             .into(),
                     );
                     base
@@ -633,7 +675,11 @@ impl AshellTheme {
                             .background
                             .weak
                             .color
-                            .scale_alpha(self.opacity)
+                            .scale_alpha(if self.opacity == 0.0 {
+                                self.hover_opacity
+                            } else {
+                                self.opacity
+                            })
                             .into(),
                     );
                     base
