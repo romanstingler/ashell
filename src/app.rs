@@ -60,6 +60,9 @@ pub struct App {
     pub workspaces: Workspaces,
     pub window_title: WindowTitle,
     pub system_info: SystemInfo,
+    pub cpu: modules::system_info_components::CpuModule,
+    pub temperature: modules::system_info_components::TemperatureModule,
+    pub system_info_new: modules::system_info_new::SystemInfoNew,
     pub keyboard_layout: KeyboardLayout,
     pub keyboard_submap: KeyboardSubmap,
     pub tray: TrayModule,
@@ -82,6 +85,9 @@ pub enum Message {
     Workspaces(modules::workspaces::Message),
     WindowTitle(modules::window_title::Message),
     SystemInfo(modules::system_info::Message),
+    Cpu(modules::system_info_components::cpu::Message),
+    Temperature(modules::system_info_components::temperature::Message),
+    SystemInfoNew(modules::system_info_new::Message),
     KeyboardLayout(modules::keyboard_layout::Message),
     KeyboardSubmap(modules::keyboard_submap::Message),
     Tray(modules::tray::Message),
@@ -111,6 +117,11 @@ impl App {
                 .map(|o| (o.name.clone(), Custom::new(o)))
                 .collect();
 
+            let system_info_service = modules::system_info_components::SystemInfoService::new(
+                config.temperature.sensor.clone(),
+            );
+            let shared_service = std::sync::Arc::new(std::sync::Mutex::new(system_info_service));
+
             (
                 App {
                     config_path,
@@ -129,6 +140,18 @@ impl App {
                     workspaces: Workspaces::new(config.workspaces),
                     window_title: WindowTitle::new(config.window_title),
                     system_info: SystemInfo::new(config.system_info),
+                    cpu: modules::system_info_components::CpuModule::new(
+                        config.cpu,
+                        shared_service.clone(),
+                    ),
+                    temperature: modules::system_info_components::TemperatureModule::new(
+                        config.temperature,
+                        shared_service.clone(),
+                    ),
+                    system_info_new: modules::system_info_new::SystemInfoNew::new(
+                        config.system_info_new,
+                        shared_service,
+                    ),
                     keyboard_layout: KeyboardLayout::new(config.keyboard_layout),
                     keyboard_submap: KeyboardSubmap::default(),
                     tray: TrayModule::default(),
@@ -174,6 +197,20 @@ impl App {
             ));
 
         self.system_info = SystemInfo::new(config.system_info);
+
+        let system_info_service = modules::system_info_components::SystemInfoService::new(
+            config.temperature.sensor.clone(),
+        );
+        let shared_service = std::sync::Arc::new(std::sync::Mutex::new(system_info_service));
+
+        self.cpu =
+            modules::system_info_components::CpuModule::new(config.cpu, shared_service.clone());
+        self.temperature = modules::system_info_components::TemperatureModule::new(
+            config.temperature,
+            shared_service.clone(),
+        );
+        self.system_info_new =
+            modules::system_info_new::SystemInfoNew::new(config.system_info_new, shared_service);
 
         let _ = self
             .keyboard_layout
@@ -325,6 +362,18 @@ impl App {
             }
             Message::SystemInfo(msg) => {
                 self.system_info.update(msg);
+                Task::none()
+            }
+            Message::Cpu(msg) => {
+                self.cpu.update(msg);
+                Task::none()
+            }
+            Message::Temperature(msg) => {
+                self.temperature.update(msg);
+                Task::none()
+            }
+            Message::SystemInfoNew(msg) => {
+                self.system_info_new.update(msg);
                 Task::none()
             }
             Message::KeyboardLayout(message) => self
@@ -545,6 +594,28 @@ impl App {
                     self.system_info
                         .menu_view(&self.theme)
                         .map(Message::SystemInfo),
+                    MenuSize::Medium,
+                    *button_ui_ref,
+                ),
+                Some((MenuType::Cpu, button_ui_ref)) => self.menu_wrapper(
+                    id,
+                    self.cpu.menu_view(&self.theme).map(Message::Cpu),
+                    MenuSize::Medium,
+                    *button_ui_ref,
+                ),
+                Some((MenuType::Temperature, button_ui_ref)) => self.menu_wrapper(
+                    id,
+                    self.temperature
+                        .menu_view(&self.theme)
+                        .map(Message::Temperature),
+                    MenuSize::Medium,
+                    *button_ui_ref,
+                ),
+                Some((MenuType::SystemInfoNew, button_ui_ref)) => self.menu_wrapper(
+                    id,
+                    self.system_info_new
+                        .menu_view(&self.theme)
+                        .map(Message::SystemInfoNew),
                     MenuSize::Medium,
                     *button_ui_ref,
                 ),

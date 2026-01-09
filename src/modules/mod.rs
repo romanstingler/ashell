@@ -21,6 +21,8 @@ pub mod media_player;
 pub mod privacy;
 pub mod settings;
 pub mod system_info;
+pub mod system_info_components;
+pub mod system_info_new;
 pub mod tray;
 pub mod updates;
 pub mod window_title;
@@ -272,6 +274,20 @@ impl App {
                 self.system_info.view(&self.theme).map(Message::SystemInfo),
                 Some(OnModulePress::ToggleMenu(MenuType::SystemInfo)),
             )),
+            ModuleName::Cpu => Some((
+                self.cpu.view(&self.theme).map(Message::Cpu),
+                Some(OnModulePress::ToggleMenu(MenuType::Cpu)),
+            )),
+            ModuleName::Temperature => Some((
+                self.temperature.view(&self.theme).map(Message::Temperature),
+                Some(OnModulePress::ToggleMenu(MenuType::Temperature)),
+            )),
+            ModuleName::SystemInfoNew => Some((
+                self.system_info_new
+                    .view(&self.theme)
+                    .map(Message::SystemInfoNew),
+                Some(OnModulePress::ToggleMenu(MenuType::SystemInfoNew)),
+            )),
             ModuleName::KeyboardLayout => self.keyboard_layout.view(&self.theme).map(|view| {
                 (
                     view.map(Message::KeyboardLayout),
@@ -326,6 +342,15 @@ impl App {
             ModuleName::SystemInfo => {
                 Some(self.system_info.subscription().map(Message::SystemInfo))
             }
+            ModuleName::Cpu => Some(self.cpu.subscription().map(Message::Cpu)),
+            ModuleName::Temperature => {
+                Some(self.temperature.subscription().map(Message::Temperature))
+            }
+            ModuleName::SystemInfoNew => Some(
+                self.system_info_new
+                    .subscription()
+                    .map(Message::SystemInfoNew),
+            ),
             ModuleName::KeyboardLayout => Some(
                 self.keyboard_layout
                     .subscription()

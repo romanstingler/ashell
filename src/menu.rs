@@ -19,6 +19,9 @@ pub enum MenuType {
     Tray(String),
     MediaPlayer,
     SystemInfo,
+    Cpu,
+    Temperature,
+    SystemInfoNew,
 }
 
 #[derive(Clone, Debug)]
