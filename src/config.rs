@@ -246,6 +246,7 @@ pub enum SettingsIndicator {
     Bluetooth,
     Battery,
     PeripheralBattery,
+    Brightness,
 }
 
 #[derive(Deserialize, Copy, Clone, Default, PartialEq, Eq, Debug)]
@@ -280,6 +281,7 @@ pub struct SettingsModuleConfig {
     pub audio_indicator_format: SettingsFormat,
     pub network_indicator_format: SettingsFormat,
     pub bluetooth_indicator_format: SettingsFormat,
+    pub brightness_indicator_format: SettingsFormat,
     pub audio_sinks_more_cmd: Option<String>,
     pub audio_sources_more_cmd: Option<String>,
     pub wifi_more_cmd: Option<String>,
@@ -307,6 +309,7 @@ impl Default for SettingsModuleConfig {
             audio_indicator_format: SettingsFormat::Icon,
             network_indicator_format: SettingsFormat::Icon,
             bluetooth_indicator_format: SettingsFormat::Icon,
+            brightness_indicator_format: SettingsFormat::Icon,
             audio_sinks_more_cmd: Default::default(),
             audio_sources_more_cmd: Default::default(),
             wifi_more_cmd: Default::default(),
@@ -322,6 +325,7 @@ impl Default for SettingsModuleConfig {
                 SettingsIndicator::Network,
                 SettingsIndicator::Vpn,
                 SettingsIndicator::Battery,
+                SettingsIndicator::Brightness,
             ],
             custom_buttons: Default::default(),
         }
