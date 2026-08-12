@@ -17,7 +17,11 @@ use crate::{
 use chrono::{DateTime, Local};
 use iced::{
     Alignment, Border, Column, Element, Length, Padding, Row, Size, Subscription, Task, Theme,
-    widget::{Space, blur, button, column, container, image, row, scrollable, sensor, svg, text},
+    time::every,
+    widget::{
+        Space, blur, button, column, container, image, mouse_area, row, scrollable, sensor, svg,
+        text,
+    },
 };
 use itertools::Itertools;
 use log::error;
@@ -126,6 +130,9 @@ pub enum Message {
     StartCollapse(u32),
     DismissAnimationComplete(u32),
     ToastResized(Size),
+    ToastHovered(u32),
+    ToastUnhovered(u32),
+    Tick,
 }
 
 #[derive(Debug, PartialEq)]
@@ -149,6 +156,8 @@ pub enum Action {
 const SLIDE_ANIMATION: Duration = slide::DEFAULT_DURATION;
 const COLLAPSE_ANIMATION: Duration = collapsible::DEFAULT_DURATION;
 
+const TICK_INTERVAL: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DismissPhase {
     Sliding,
@@ -163,6 +172,8 @@ pub struct Notifications {
     blocklist: Vec<crate::config::RegexCfg>,
     toasts: VecDeque<u32>,
     dismiss_phases: HashMap<u32, DismissPhase>,
+    toast_timers: HashMap<u32, Duration>,
+    hovered_toasts: HashSet<u32>,
     animations_enabled: bool,
 }
 
@@ -177,6 +188,8 @@ impl Notifications {
             blocklist,
             toasts: VecDeque::new(),
             dismiss_phases: HashMap::new(),
+            toast_timers: HashMap::new(),
+            hovered_toasts: HashSet::new(),
             animations_enabled,
         }
     }
@@ -206,12 +219,16 @@ impl Notifications {
         let had_toasts = !self.toasts.is_empty();
         self.toasts.clear();
         self.dismiss_phases.clear();
+        self.toast_timers.clear();
+        self.hovered_toasts.clear();
         had_toasts
     }
 
     fn remove_toast(&mut self, id: u32) -> bool {
         let had_toasts = !self.toasts.is_empty();
         self.toasts.retain(|&toast_id| toast_id != id);
+        self.toast_timers.remove(&id);
+        self.hovered_toasts.remove(&id);
         had_toasts
     }
 
@@ -219,6 +236,10 @@ impl Notifications {
         let had_toasts = !self.toasts.is_empty();
         let ids: HashSet<u32> = ids.iter().copied().collect();
         self.toasts.retain(|toast_id| !ids.contains(toast_id));
+        for id in &ids {
+            self.toast_timers.remove(id);
+            self.hovered_toasts.remove(id);
+        }
         had_toasts
     }
 
@@ -262,11 +283,12 @@ impl Notifications {
                 while self.toasts.len() >= self.config.toast_limit {
                     if let Some(evicted) = self.toasts.pop_front() {
                         self.dismiss_phases.remove(&evicted);
+                        self.toast_timers.remove(&evicted);
+                        self.hovered_toasts.remove(&evicted);
                     }
                 }
                 self.toasts.push_back(notification.id);
 
-                let notification_id = notification.id;
                 // Critical notifications are persistent per the freedesktop
                 // spec: they must be acknowledged by the user.
                 let timeout = if notification.urgency == Urgency::Critical {
@@ -275,19 +297,11 @@ impl Notifications {
                     toast_timeout(notification.expire_timeout, self.config.toast_timeout)
                 };
 
-                let timer_task = if let Some(timeout) = timeout {
-                    Task::perform(
-                        async move {
-                            tokio::time::sleep(timeout).await;
-                            notification_id
-                        },
-                        Message::ExpireToast,
-                    )
-                } else {
-                    Task::none()
-                };
+                if let Some(timeout) = timeout {
+                    self.toast_timers.insert(notification.id, timeout);
+                }
 
-                Action::Show(timer_task)
+                Action::Show(Task::none())
             }
             NotificationEvent::Closed(id) => {
                 let id = *id;
@@ -321,6 +335,8 @@ impl Notifications {
                 self.config = config;
                 if hide {
                     self.toasts.clear();
+                    self.toast_timers.clear();
+                    self.hovered_toasts.clear();
                     Action::Hide(Task::none())
                 } else {
                     Action::None
@@ -451,6 +467,39 @@ impl Notifications {
                 self.hide_toasts_if_empty(had_toasts)
             }
             Message::ToastResized(size) => Action::UpdateToastInputRegion(size),
+            Message::ToastHovered(id) => {
+                self.hovered_toasts.insert(id);
+                Action::None
+            }
+            Message::ToastUnhovered(id) => {
+                self.hovered_toasts.remove(&id);
+                Action::None
+            }
+            Message::Tick => {
+                let mut expired = Vec::new();
+                for (id, remaining) in self.toast_timers.iter_mut() {
+                    if self.dismiss_phases.contains_key(id) || self.hovered_toasts.contains(id) {
+                        continue;
+                    }
+                    if *remaining <= TICK_INTERVAL {
+                        expired.push(*id);
+                    } else {
+                        *remaining -= TICK_INTERVAL;
+                    }
+                }
+                if expired.is_empty() {
+                    Action::None
+                } else {
+                    for id in &expired {
+                        self.toast_timers.remove(id);
+                    }
+                    Action::Task(Task::batch(
+                        expired
+                            .into_iter()
+                            .map(|id| Task::done(Message::ExpireToast(id))),
+                    ))
+                }
+            }
         }
     }
 
@@ -688,26 +737,30 @@ impl Notifications {
                 let phase = self.dismiss_phases.get(&toast_id).copied();
                 let is_dismissing = phase.is_some();
                 let is_collapsing = phase == Some(DismissPhase::Collapsing);
-                toast_column = toast_column.push(
-                    collapsible(
-                        !is_collapsing,
-                        slide(!is_dismissing, slide_direction, card_width, {
-                            let card = self.notification_card(
-                                notification,
-                                Message::DismissToast(notification.id),
-                                true,
-                            );
-                            if blur_enabled {
-                                blur(card_radius, card).into()
-                            } else {
-                                card
-                            }
-                        })
-                        .animated(self.animations_enabled)
-                        .key(toast_id as u64),
-                    )
+                let toast_element = collapsible(
+                    !is_collapsing,
+                    slide(!is_dismissing, slide_direction, card_width, {
+                        let card = self.notification_card(
+                            notification,
+                            Message::DismissToast(notification.id),
+                            true,
+                        );
+                        if blur_enabled {
+                            blur(card_radius, card).into()
+                        } else {
+                            card
+                        }
+                    })
                     .animated(self.animations_enabled)
                     .key(toast_id as u64),
+                )
+                .animated(self.animations_enabled)
+                .key(toast_id as u64);
+
+                toast_column = toast_column.push(
+                    mouse_area(toast_element)
+                        .on_enter(Message::ToastHovered(toast_id))
+                        .on_exit(Message::ToastUnhovered(toast_id)),
                 );
             }
         }
@@ -737,7 +790,14 @@ impl Notifications {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        NotificationsService::subscribe().map(Message::Event)
+        if self.toasts.is_empty() {
+            NotificationsService::subscribe().map(Message::Event)
+        } else {
+            Subscription::batch(vec![
+                NotificationsService::subscribe().map(Message::Event),
+                every(TICK_INTERVAL).map(|_| Message::Tick),
+            ])
+        }
     }
 
     fn grouped_notifications<'a>(&'a self) -> Element<'a, Message> {
