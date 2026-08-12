@@ -108,6 +108,13 @@ Maximum height (in pixels) of each individual toast card. Cards with less conten
 **Type:** `integer`
 **Default:** `150`
 
+### toast_timeout_bar
+
+Show a thin progress bar at the bottom of each toast that shrinks over the toast's remaining lifetime and disappears as the toast auto-closes. The bar uses the theme accent color. It is only rendered for toasts (not the persistent notification menu) and is hidden for critical or persistent notifications that never auto-dismiss.
+
+**Type:** `boolean`
+**Default:** `true`
+
 ### blocklist
 
 Notification app names to ignore.
@@ -130,5 +137,6 @@ toast_position = "TopRight"
 toast_timeout = 4000
 toast_limit = 5
 toast_max_height = 150
+toast_timeout_bar = true
 blocklist = ["blueman", "^org\\.gnome\\."]
 ```

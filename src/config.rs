@@ -442,6 +442,7 @@ pub struct NotificationsModuleConfig {
     pub toast_timeout: u64,
     pub toast_limit: usize,
     pub toast_max_height: u32,
+    pub toast_timeout_bar: bool,
     pub blocklist: Vec<RegexCfg>,
 }
 impl Default for NotificationsModuleConfig {
@@ -456,6 +457,7 @@ impl Default for NotificationsModuleConfig {
             toast_timeout: 5000,
             toast_limit: 5,
             toast_max_height: 150,
+            toast_timeout_bar: true,
             blocklist: vec![],
         }
     }

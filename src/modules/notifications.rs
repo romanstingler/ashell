@@ -156,7 +156,7 @@ pub enum Action {
 const SLIDE_ANIMATION: Duration = slide::DEFAULT_DURATION;
 const COLLAPSE_ANIMATION: Duration = collapsible::DEFAULT_DURATION;
 
-const TICK_INTERVAL: Duration = Duration::from_millis(250);
+const TICK_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DismissPhase {
@@ -172,7 +172,7 @@ pub struct Notifications {
     blocklist: Vec<crate::config::RegexCfg>,
     toasts: VecDeque<u32>,
     dismiss_phases: HashMap<u32, DismissPhase>,
-    toast_timers: HashMap<u32, Duration>,
+    toast_timers: HashMap<u32, (Duration, Duration)>,
     hovered_toasts: HashSet<u32>,
     animations_enabled: bool,
 }
@@ -298,7 +298,8 @@ impl Notifications {
                 };
 
                 if let Some(timeout) = timeout {
-                    self.toast_timers.insert(notification.id, timeout);
+                    self.toast_timers
+                        .insert(notification.id, (timeout, timeout));
                 }
 
                 Action::Show(Task::none())
@@ -477,7 +478,7 @@ impl Notifications {
             }
             Message::Tick => {
                 let mut expired = Vec::new();
-                for (id, remaining) in self.toast_timers.iter_mut() {
+                for (id, (remaining, _total)) in self.toast_timers.iter_mut() {
                     if self.dismiss_phases.contains_key(id) || self.hovered_toasts.contains(id) {
                         continue;
                     }
@@ -592,38 +593,61 @@ impl Notifications {
 
         let app_icon_button = notification_icon(notification.icon.as_ref());
 
-        let mut card = container(
-            column!(
-                Row::new()
-                    .push(
-                        Row::new()
-                            .push(app_icon_button)
-                            .push(column!(
-                                text(&notification.app_name)
-                                    .size(font_size.md)
-                                    .wrapping(text::Wrapping::WordOrGlyph),
-                                timestamp_element
-                            ))
-                            .width(Length::Fill)
-                            .spacing(space.xxs)
-                            .padding(space.xs)
-                            .align_y(Alignment::Center),
-                    )
-                    .push(
-                        icon_button(StaticIcon::Close)
-                            .kind(ButtonKind::Transparent)
-                            .hierarchy(ButtonHierarchy::Danger)
-                            .on_press(Message::CloseNotificationById(notification_id))
-                    ),
-                column!(
-                    text(&notification.summary).wrapping(text::Wrapping::WordOrGlyph),
-                    body_element,
+        let mut card_column = column!(
+            Row::new()
+                .push(
+                    Row::new()
+                        .push(app_icon_button)
+                        .push(column!(
+                            text(&notification.app_name)
+                                .size(font_size.md)
+                                .wrapping(text::Wrapping::WordOrGlyph),
+                            timestamp_element
+                        ))
+                        .width(Length::Fill)
+                        .spacing(space.xxs)
+                        .padding(space.xs)
+                        .align_y(Alignment::Center),
                 )
-                .spacing(space.xxs)
-                .padding(Padding::new(space.xs).top(0.))
+                .push(
+                    icon_button(StaticIcon::Close)
+                        .kind(ButtonKind::Transparent)
+                        .hierarchy(ButtonHierarchy::Danger)
+                        .on_press(Message::CloseNotificationById(notification_id))
+                ),
+            column!(
+                text(&notification.summary).wrapping(text::Wrapping::WordOrGlyph),
+                body_element,
             )
-            .spacing(space.xxs),
-        );
+            .spacing(space.xxs)
+            .padding(Padding::new(space.xs).top(0.))
+        )
+        .spacing(space.xxs);
+
+        if toast
+            && self.config.toast_timeout_bar
+            && let Some((remaining, total)) = self.toast_timers.get(&notification.id)
+        {
+            let accent = use_theme(|t| t.iced_theme.palette().primary);
+            let fraction =
+                remaining.as_secs_f32().max(0.0) / total.as_secs_f32().max(f32::MIN_POSITIVE);
+            let fill = ((fraction * 1000.0) as u16).clamp(0, 1000);
+            let bar_height = 3.0_f32;
+            let bar = row!(
+                container(Space::new())
+                    .width(Length::FillPortion(fill))
+                    .height(Length::Fixed(bar_height))
+                    .style(move |_t: &Theme| container::Style {
+                        background: Some(accent.into()),
+                        ..Default::default()
+                    }),
+                Space::new().width(Length::FillPortion(1000 - fill)),
+            )
+            .width(Length::Fill);
+            card_column = card_column.push(bar);
+        }
+
+        let mut card = container(card_column);
 
         if toast {
             card = card.max_height(self.config.toast_max_height).clip(true);
@@ -792,11 +816,18 @@ impl Notifications {
     pub fn subscription(&self) -> Subscription<Message> {
         if self.toasts.is_empty() {
             NotificationsService::subscribe().map(Message::Event)
-        } else {
+        } else if self.config.toast_timeout_bar
+            && self
+                .toasts
+                .iter()
+                .any(|id| self.toast_timers.contains_key(id))
+        {
             Subscription::batch(vec![
                 NotificationsService::subscribe().map(Message::Event),
                 every(TICK_INTERVAL).map(|_| Message::Tick),
             ])
+        } else {
+            NotificationsService::subscribe().map(Message::Event)
         }
     }
 
