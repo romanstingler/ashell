@@ -104,8 +104,8 @@ impl BrightnessSettings {
                 Action::None
             }
             Message::MenuOpened => {
-                if let Some(service) = self.service.as_mut() {
-                    service.sync_brightness();
+                if let Some(service) = self.service.as_ref() {
+                    return Action::Command(service.sync_brightness().map(Message::Event));
                 }
                 Action::None
             }

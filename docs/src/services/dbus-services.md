@@ -45,7 +45,7 @@ The `#[zbus::proxy]` macro generates a `Adapter1Proxy` struct with async methods
 | MPRIS | Session | `org.mpris.MediaPlayer2.*` | `services/mpris/dbus.rs` |
 | Tray | Session | `org.kde.StatusNotifierWatcher` | `services/tray/dbus.rs` |
 | Privacy | Session | `org.freedesktop.portal.Desktop` | `services/privacy.rs` |
-| Brightness | System | `org.freedesktop.login1.Session` | `services/brightness.rs` |
+| Brightness | System | `org.freedesktop.login1.Session` | `services/brightness/backlight.rs` |
 
 ## Common D-Bus Service Structure
 

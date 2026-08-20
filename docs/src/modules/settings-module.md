@@ -68,7 +68,7 @@ Each sub-module depends on a specific system service. If the service is not avai
 |------------|-----------------|---------------|
 | Audio | PulseAudio or PipeWire-Pulse | — (uses libpulse directly) |
 | Bluetooth | `bluez` | `org.bluez` |
-| Brightness | systemd-logind (usually pre-installed) | `org.freedesktop.login1` |
+| Brightness | systemd-logind (usually pre-installed) or `/dev/i2c-*` access for DDC/CI | `org.freedesktop.login1` |
 | Network | `networkmanager` or `iwd` | `org.freedesktop.NetworkManager` or `net.connman.iwd` |
 | Power (battery) | `upower` | `org.freedesktop.UPower` |
 

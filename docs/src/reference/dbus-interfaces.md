@@ -18,7 +18,7 @@ ashell connects to several D-Bus services. This reference lists all interfaces u
 | UPower | `org.freedesktop.UPower` | `services/upower/dbus.rs` | Power daemon | `upower` |
 | UPower | `org.freedesktop.UPower.Device` | `services/upower/dbus.rs` | Battery/device info | `upower` |
 | logind | `org.freedesktop.login1.Manager` | `services/logind.rs` | Sleep/wake detection, power actions | systemd-logind |
-| logind | `org.freedesktop.login1.Session` | `services/brightness.rs` | Brightness control via SetBrightness | systemd-logind |
+| logind | `org.freedesktop.login1.Session` | `services/brightness/backlight.rs` | Brightness control via SetBrightness | systemd-logind |
 
 ## Session Bus
 

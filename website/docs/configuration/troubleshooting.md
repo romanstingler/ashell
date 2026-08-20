@@ -87,6 +87,24 @@ exec-once = env WGPU_POWER_PREF=high ashell
 - Start Telegram after ashell
 - Restart Telegram after starting ashell
 
+## Brightness Slider Not Shown
+
+**Problem:** The brightness slider and indicator don't appear.
+
+**Cause:** ashell needs either a backlight device (`/sys/class/backlight`) or
+DDC/CI capable monitors it can talk to over I2C.
+
+**Solutions:**
+
+- Laptops: verify a backlight device exists (`ls /sys/class/backlight`).
+- Desktops: brightness is controlled via DDC/CI, which needs read/write access
+  to `/dev/i2c-*`. Add your user to the `i2c` group or install a udev rule:
+  ```
+  KERNEL=="i2c-[0-9]*", SUBSYSTEM=="i2c-dev", GROUP="i2c", MODE="0660"
+  ```
+  Then replug the monitor (or reboot) and restart ashell.
+- Check the logs with `RUST_LOG=debug ashell` for brightness backend errors.
+
 ## Debug Mode
 
 Run with debug logging to find issues:

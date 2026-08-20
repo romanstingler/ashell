@@ -266,6 +266,27 @@ The default value is `Icon`.
 brightness_indicator_format = "IconAndPercentage"
 ```
 
+### Brightness Backends
+
+ashell controls the screen brightness using the system backlight interface
+(`/sys/class/backlight`), which covers laptops and other panels with native
+backlight support.
+
+When no backlight device is found (typical desktop setups), ashell falls back
+to controlling external monitors over DDC/CI. This requires read/write access
+to the `/dev/i2c-*` devices: make sure your user is in the `i2c` group or add
+a udev rule like:
+
+```
+KERNEL=="i2c-[0-9]*", SUBSYSTEM=="i2c-dev", GROUP="i2c", MODE="0660"
+```
+
+With multiple DDC/CI monitors, the slider drives all of them together and the
+indicator shows their average brightness.
+
+Note that DDC/CI cannot report brightness changes: the value is refreshed when
+the settings menu is opened.
+
 ## Peripheral Indicators
 
 With the `peripheral_indicators` you can decide which peripheral battery indicators

@@ -65,7 +65,11 @@ src/
 │   │   ├── hyprland.rs       # Hyprland IPC integration
 │   │   └── niri.rs           # Niri IPC integration
 │   ├── audio.rs             # PulseAudio/PipeWire audio service
-│   ├── brightness.rs        # Display brightness via sysfs
+│   ├── brightness/          # Display brightness (backlight sysfs or DDC/CI)
+│   │   ├── mod.rs            # Brightness service, backend detection
+│   │   ├── backend.rs        # BrightnessBackend trait and backend dispatch
+│   │   ├── backlight.rs      # sysfs/logind backlight backend
+│   │   └── ddc.rs            # DDC/CI backend for external monitors
 │   ├── bluetooth/
 │   │   ├── mod.rs            # Bluetooth service logic
 │   │   └── dbus.rs           # BlueZ D-Bus proxy definitions

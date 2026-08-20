@@ -182,7 +182,7 @@ on_click = "vpn-toggle"
 |------------|-----------------|
 | Audio (volume) | PulseAudio or PipeWire-Pulse |
 | Bluetooth | `bluez` |
-| Brightness | systemd-logind (usually present) |
+| Brightness | systemd-logind (usually present) or `/dev/i2c-*` access for DDC/CI |
 | Network | `networkmanager` or `iwd` |
 | Power (battery) | `upower` |
 
