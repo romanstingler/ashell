@@ -13,7 +13,7 @@ use iced::{
     },
     stream::channel,
 };
-use log::{error, warn};
+use log::{debug, error, warn};
 use serde::Deserialize;
 use std::{any::TypeId, fmt, time::Duration};
 use zbus::zvariant::ObjectPath;
@@ -291,14 +291,56 @@ pub struct UPowerService {
     conn: zbus::Connection,
 }
 
+/// Base delay before a failed initialization is retried. Doubled on every
+/// consecutive failure, capped by `INIT_RETRY_MAX_BACKOFF_STEPS`.
+const INIT_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Caps the exponential backoff at `INIT_RETRY_DELAY * 2^n`.
+const INIT_RETRY_MAX_BACKOFF_STEPS: u32 = 5;
+/// Device added/removed signals arrive in bursts while UPower cold-plugs, so
+/// coalesce them before triggering a re-initialization.
+const DEVICE_CHANGE_DEBOUNCE: Duration = Duration::from_secs(1);
+/// While no system battery is known, look again after this delay: right after
+/// login UPower may not have cold-plugged the battery yet, and a device that
+/// already exists can report incomplete properties for a moment. No
+/// `DeviceAdded` signal follows in the latter case, so a timer is needed.
+const BATTERY_RECHECK_DELAY: Duration = Duration::from_secs(5);
+/// How many times to look for a system battery before accepting that this
+/// machine simply doesn't have one.
+const BATTERY_RECHECKS: u32 = 6;
+
 enum State {
-    Init,
-    Active(
-        zbus::Connection,
-        Option<Vec<ObjectPath<'static>>>,
-        Vec<ObjectPath<'static>>,
-    ),
-    Error,
+    /// Connect to the system bus and initialize; carries the number of
+    /// consecutive failures so far.
+    Init(u32),
+    /// Re-initialize on an existing connection, either because the device list
+    /// changed or because we are still looking for a system battery.
+    Refresh {
+        conn: zbus::Connection,
+        battery_rechecks: u32,
+    },
+    Active {
+        conn: zbus::Connection,
+        system_battery_paths: Option<Vec<ObjectPath<'static>>>,
+        peripheral_paths: Vec<ObjectPath<'static>>,
+        /// Remaining attempts to find a system battery, see `BATTERY_RECHECKS`.
+        battery_rechecks: u32,
+    },
+    /// Initialization failed; wait and try again instead of giving up for the
+    /// lifetime of the process.
+    Error(u32),
+}
+
+/// Items produced by the upower event streams. Property changes are forwarded to
+/// the UI as-is, while a device being added or removed needs a full
+/// re-initialization: whether there is a system battery at all, and which device
+/// paths we listen on, is decided during initialization.
+enum EventKind {
+    Update(UPowerEvent),
+    /// A device appeared or disappeared, re-initialize with a fresh battery
+    /// recheck budget.
+    DevicesChanged,
+    /// No system battery was found yet and the recheck timer fired.
+    RecheckBattery,
 }
 
 impl ReadOnlyService for UPowerService {
@@ -329,7 +371,7 @@ impl ReadOnlyService for UPowerService {
     fn subscribe() -> Subscription<ServiceEvent<Self>> {
         Subscription::run_with(TypeId::of::<Self>(), |_| {
             channel(100, async |mut output| {
-                let mut state = State::Init;
+                let mut state = State::Init(0);
 
                 loop {
                     state = UPowerService::start_listening(state, &mut output).await;
@@ -420,8 +462,11 @@ impl UPowerService {
                 };
                 let percentage = match battery.percentage().await {
                     Ok(pct) => pct as i64,
-                    Err(_) => {
-                        // If we can't get percentage data, don't show battery at all
+                    Err(err) => {
+                        // Without a percentage there is nothing to show. This used
+                        // to fail silently and was indistinguishable from a system
+                        // without a battery.
+                        warn!("Failed to read system battery percentage: {err}");
                         return Ok(None);
                     }
                 };
@@ -435,7 +480,11 @@ impl UPowerService {
                     battery,
                 )))
             }
-            _ => Ok(None),
+            None => {
+                debug!("UPower reported no system battery device");
+
+                Ok(None)
+            }
         }
     }
 
@@ -470,6 +519,10 @@ impl UPowerService {
             };
 
             let Ok(state_raw) = device.state().await else {
+                warn!(
+                    "Failed to read device's state for device '{}'",
+                    device.inner().path().as_str()
+                );
                 continue;
             };
             let state = match state_raw {
@@ -481,7 +534,9 @@ impl UPowerService {
                         );
                         continue;
                     };
-                    BatteryStatus::Charging(Duration::from_secs(time_to_full as u64))
+                    BatteryStatus::Charging(Duration::from_secs(
+                        time_to_full.try_into().unwrap_or_default(),
+                    ))
                 }
                 2 => {
                     let Ok(time_to_empty) = device.time_to_empty().await else {
@@ -491,7 +546,9 @@ impl UPowerService {
                         );
                         continue;
                     };
-                    BatteryStatus::Discharging(Duration::from_secs(time_to_empty as u64))
+                    BatteryStatus::Discharging(Duration::from_secs(
+                        time_to_empty.try_into().unwrap_or_default(),
+                    ))
                 }
                 4 => BatteryStatus::Full,
                 5 | 6 => BatteryStatus::NotCharging,
@@ -535,7 +592,8 @@ impl UPowerService {
         conn: &zbus::Connection,
         system_battery_devices: Option<&Vec<ObjectPath<'static>>>,
         peripheral_paths: &[ObjectPath<'static>],
-    ) -> anyhow::Result<impl Stream<Item = UPowerEvent> + use<>> {
+        battery_rechecks: u32,
+    ) -> anyhow::Result<impl Stream<Item = EventKind> + use<>> {
         let system_battery_event = if let Some(battery_devices) = system_battery_devices {
             let upower = UPowerDbus::new(conn).await?;
 
@@ -674,39 +732,25 @@ impl UPowerService {
         };
 
         let upower_proxy = UPowerProxy::new(conn).await?;
-        let device_added_event = upower_proxy
-            .receive_device_added()
-            .await?
-            .filter_map({
-                let conn = conn.clone();
-                move |_added_device| {
-                    let conn = conn.clone();
-                    async move {
-                        Self::initialize_peripheral_data(&conn)
-                            .await
-                            .ok()
-                            .map(UPowerEvent::UpdatePeripherals)
-                    }
-                }
-            })
-            .boxed();
+        // A battery (or a peripheral) that shows up after initialization has to
+        // trigger a full re-initialization: the streams above only cover the
+        // devices that were known at that point, and a system battery that was
+        // missing back then has no stream at all.
+        let devices_changed_event = stream_select!(
+            upower_proxy.receive_device_added().await?.map(|_| ()),
+            upower_proxy.receive_device_removed().await?.map(|_| ()),
+        )
+        .throttle(DEVICE_CHANGE_DEBOUNCE)
+        .map(|_| EventKind::DevicesChanged)
+        .boxed();
 
-        let device_removed_event = upower_proxy
-            .receive_device_removed()
-            .await?
-            .filter_map({
-                let conn = conn.clone();
-                move |_removed_device| {
-                    let conn = conn.clone();
-                    async move {
-                        Self::initialize_peripheral_data(&conn)
-                            .await
-                            .ok()
-                            .map(UPowerEvent::UpdatePeripherals)
-                    }
-                }
-            })
-            .boxed();
+        let battery_recheck_event = if system_battery_devices.is_none() && battery_rechecks > 0 {
+            once(async { tokio::time::sleep(BATTERY_RECHECK_DELAY).await })
+                .map(|_| EventKind::RecheckBattery)
+                .boxed()
+        } else {
+            pending().boxed()
+        };
 
         let powerprofiles = PowerProfilesProxy::new(conn).await?;
         let power_profile_event =
@@ -723,69 +767,150 @@ impl UPowerService {
                 });
 
         Ok(stream_select!(
-            system_battery_event,
-            charge_limit_event,
-            peripheral_event,
-            device_added_event,
-            device_removed_event,
-            power_profile_event
+            system_battery_event.map(EventKind::Update),
+            charge_limit_event.map(EventKind::Update),
+            peripheral_event.map(EventKind::Update),
+            devices_changed_event,
+            battery_recheck_event,
+            power_profile_event.map(EventKind::Update)
         ))
+    }
+
+    async fn initialize(
+        conn: zbus::Connection,
+        output: &mut Sender<ServiceEvent<Self>>,
+        failures: u32,
+        battery_rechecks: u32,
+    ) -> State {
+        match UPowerService::initialize_data(&conn).await {
+            Ok((system_battery, charge_limit, peripherals, power_profile)) => {
+                let peripheral_paths = peripherals
+                    .iter()
+                    .map(|p| p.device.inner().path().clone())
+                    .collect();
+
+                let service = UPowerService {
+                    system_battery: system_battery.as_ref().map(|b| b.0),
+                    charge_limit,
+                    peripherals,
+                    power_profile,
+                    conn: conn.clone(),
+                };
+                let _ = output.send(ServiceEvent::Init(service)).await;
+
+                let system_battery_paths = system_battery.map(|b| b.1);
+
+                State::Active {
+                    conn,
+                    battery_rechecks: if system_battery_paths.is_some() {
+                        0
+                    } else {
+                        battery_rechecks
+                    },
+                    system_battery_paths,
+                    peripheral_paths,
+                }
+            }
+            Err(err) => {
+                // Only shout about the first failure: the retry keeps running for
+                // the whole session and UPower may simply not be installed.
+                if failures == 0 {
+                    error!("Failed to initialize upower service: {err}");
+                } else {
+                    debug!("Failed to initialize upower service, retry {failures}: {err}");
+                }
+
+                State::Error(failures + 1)
+            }
+        }
     }
 
     async fn start_listening(state: State, output: &mut Sender<ServiceEvent<Self>>) -> State {
         match state {
-            State::Init => match zbus::Connection::system().await {
-                Ok(conn) => match UPowerService::initialize_data(&conn).await {
-                    Ok((system_battery, charge_limit, peripherals, power_profile)) => {
-                        let peripheral_paths = peripherals
-                            .iter()
-                            .map(|p| p.device.inner().path().clone())
-                            .collect();
-
-                        let service = UPowerService {
-                            system_battery: system_battery.as_ref().map(|b| b.0),
-                            charge_limit,
-                            peripherals,
-                            power_profile,
-                            conn: conn.clone(),
-                        };
-                        let _ = output.send(ServiceEvent::Init(service)).await;
-
-                        State::Active(conn, system_battery.map(|b| b.1), peripheral_paths)
-                    }
-                    Err(err) => {
-                        error!("Failed to initialize upower service: {err}");
-
-                        State::Error
-                    }
-                },
+            State::Init(failures) => match zbus::Connection::system().await {
+                Ok(conn) => {
+                    UPowerService::initialize(conn, output, failures, BATTERY_RECHECKS).await
+                }
                 Err(err) => {
-                    error!("Failed to connect to system bus for upower: {err}");
-                    State::Error
+                    if failures == 0 {
+                        error!("Failed to connect to system bus for upower: {err}");
+                    } else {
+                        debug!(
+                            "Failed to connect to system bus for upower, retry {failures}: {err}"
+                        );
+                    }
+
+                    State::Error(failures + 1)
                 }
             },
-            State::Active(conn, system_battery_paths, peripheral_paths) => {
-                match UPowerService::events(&conn, system_battery_paths.as_ref(), &peripheral_paths)
-                    .await
+            State::Refresh {
+                conn,
+                battery_rechecks,
+            } => UPowerService::initialize(conn, output, 0, battery_rechecks).await,
+            State::Active {
+                conn,
+                system_battery_paths,
+                peripheral_paths,
+                battery_rechecks,
+            } => {
+                match UPowerService::events(
+                    &conn,
+                    system_battery_paths.as_ref(),
+                    &peripheral_paths,
+                    battery_rechecks,
+                )
+                .await
                 {
                     Ok(mut events) => {
                         while let Some(event) = events.next().await {
-                            let _ = output.send(ServiceEvent::Update(event)).await;
+                            match event {
+                                EventKind::Update(event) => {
+                                    let _ = output.send(ServiceEvent::Update(event)).await;
+                                }
+                                EventKind::DevicesChanged => {
+                                    debug!("UPower device list changed, re-initializing");
+
+                                    return State::Refresh {
+                                        conn,
+                                        battery_rechecks: BATTERY_RECHECKS,
+                                    };
+                                }
+                                EventKind::RecheckBattery => {
+                                    debug!(
+                                        "No system battery yet, looking again ({battery_rechecks} attempts left)"
+                                    );
+
+                                    return State::Refresh {
+                                        conn,
+                                        battery_rechecks: battery_rechecks.saturating_sub(1),
+                                    };
+                                }
+                            }
                         }
 
-                        State::Active(conn, system_battery_paths, peripheral_paths)
+                        State::Active {
+                            conn,
+                            system_battery_paths,
+                            peripheral_paths,
+                            battery_rechecks,
+                        }
                     }
                     Err(err) => {
                         error!("Failed to listen for upower events: {err}");
 
-                        State::Error
+                        // The error above is already reported, so let the retry
+                        // that follows log at debug level.
+                        State::Error(1)
                     }
                 }
             }
-            State::Error => {
-                let _ = pending::<u8>().next().await;
+            State::Error(failures) => {
+                let delay = INIT_RETRY_DELAY
+                    * 2u32.pow(failures.saturating_sub(1).min(INIT_RETRY_MAX_BACKOFF_STEPS));
+                debug!("Retrying upower initialization in {}s", delay.as_secs());
+                tokio::time::sleep(delay).await;
 
-                State::Error
+                State::Init(failures)
             }
         }
     }

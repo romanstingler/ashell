@@ -1,5 +1,5 @@
 use super::ChargeLimit;
-use log::debug;
+use log::{debug, warn};
 use std::ops::Deref;
 use zbus::{
     proxy,
@@ -370,23 +370,22 @@ impl UPowerDbus<'_> {
 
         let mut res = Vec::new();
 
-        for device in devices {
-            let device = DeviceProxy::builder(self.inner().connection())
-                .path(device)?
-                .build()
-                .await?;
-
-            let device_type = device
-                .device_type()
-                .await?
-                .try_into()
-                .unwrap_or(UpDeviceKind::Unknown);
-
-            let power_supply = device.power_supply().await?;
+        for path in devices {
+            // A device can vanish between the enumeration and the property reads
+            // (peripherals come and go, and UPower may still be cold-plugging
+            // right after login). Skip the offending device instead of failing
+            // the whole enumeration, which used to disable the service.
+            let (device, device_type, power_supply) = match self.inspect_device(&path).await {
+                Ok(device) => device,
+                Err(err) => {
+                    warn!("Skipping upower device '{}': {err}", path.as_str());
+                    continue;
+                }
+            };
 
             debug!(
                 "Device: {}, Type: {}, Power Supply: {}",
-                device.inner().path(),
+                path.as_str(),
                 device_type,
                 power_supply
             );
@@ -397,6 +396,26 @@ impl UPowerDbus<'_> {
         }
 
         Ok(res)
+    }
+
+    async fn inspect_device(
+        &self,
+        path: &OwnedObjectPath,
+    ) -> anyhow::Result<(DeviceProxy<'static>, UpDeviceKind, bool)> {
+        let device = DeviceProxy::builder(self.inner().connection())
+            .path(path.clone())?
+            .build()
+            .await?;
+
+        let device_type = device
+            .device_type()
+            .await?
+            .try_into()
+            .unwrap_or(UpDeviceKind::Unknown);
+
+        let power_supply = device.power_supply().await?;
+
+        Ok((device, device_type, power_supply))
     }
 }
 
