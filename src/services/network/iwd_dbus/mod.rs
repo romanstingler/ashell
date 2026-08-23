@@ -255,21 +255,21 @@ impl super::NetworkBackend for IwdDbus<'_> {
                 Err(e) => info!("Failed to unregister agent at {path}: {e}"),
             }
 
-            // Create a new agent with the password
             let (tx, password_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-            // Register the new agent
-            let pw_agent = PWAgent { password_rx };
-            self.inner()
-                .connection()
-                .object_server()
-                .at(path.clone(), pw_agent)
-                .await?;
+            // `ObjectServer::at` reports an already exported interface as `Ok(false)`
+            // instead of replacing it, so the agent from the previous connect has to
+            // be removed first. Fails with `InterfaceNotFound` on the first connect.
+            let server = self.inner().connection().object_server();
+            let _ = server.remove::<PWAgent, _>(&path).await;
+            if !server.at(&path, PWAgent { password_rx }).await? {
+                warn!("Stale passphrase agent still exported at {path}, connect will fail");
+            }
+
+            // Buffer the passphrase before iwd can ask for it.
+            tx.send(p)?;
 
             agent_manager.register_agent(&path).await?;
-
-            // Send the password to the agent channel
-            tx.send(p)?;
         }
 
         let net = NetworkProxy::builder(self.inner().connection())
