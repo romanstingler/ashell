@@ -671,10 +671,21 @@ impl Service for NetworkService {
             }
             NetworkCommand::SelectAccessPoint((access_point, password)) => Task::perform(
                 async move {
-                    bc.select_access_point(&access_point, password)
-                        .await
-                        .unwrap_or_default();
-                    bc.known_connections().await.unwrap_or_default()
+                    if let Err(err) = bc.select_access_point(&access_point, password).await {
+                        error!(
+                            "SelectAccessPoint command: failed to connect to {}: {err}",
+                            access_point.ssid
+                        );
+                    }
+                    match bc.known_connections().await {
+                        Ok(known_connections) => known_connections,
+                        Err(err) => {
+                            error!(
+                                "SelectAccessPoint command: failed to read known connections: {err}"
+                            );
+                            Vec::new()
+                        }
+                    }
                 },
                 |known_connections| {
                     ServiceEvent::Update(NetworkEvent::KnownConnections(known_connections))
