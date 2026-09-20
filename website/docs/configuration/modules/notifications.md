@@ -132,6 +132,15 @@ Maximum height (in pixels) of each individual toast card. Cards with less conten
 **Type:** `integer`
 **Default:** `150`
 
+### toast_timeout_bar
+
+Show a thin bar under each toast that shrinks over the toast's remaining lifetime, so you can see how long it has left before it auto-dismisses. The bar is drawn in the theme's accent colour.
+
+It appears on toasts only, never in the notification menu, and only on toasts that actually expire: a critical notification, or one sent with `expire_timeout = 0`, is persistent and has nothing to count down. It pauses along with the timeout while the pointer is over the toasts, and steps in quarter-second increments instead of animating when `animations.enabled` is `false`.
+
+**Type:** `boolean`
+**Default:** `true`
+
 ### blocklist
 
 Notification app names to ignore.
@@ -154,5 +163,6 @@ toast_position = "TopRight"
 toast_timeout = 4000
 toast_limit = 5
 toast_max_height = 150
+toast_timeout_bar = true
 blocklist = ["blueman", "^org\\.gnome\\."]
 ```

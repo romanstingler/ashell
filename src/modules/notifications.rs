@@ -1,5 +1,6 @@
 use crate::{
     components::collapsible::{self, collapsible},
+    components::countdown_bar::{Countdown, countdown_bar},
     components::icons::{StaticIcon, icon, icon_button},
     components::scrollable,
     components::slide::{self, SlideDirection, slide},
@@ -133,6 +134,9 @@ pub enum Action {
     UpdateToastInputRegion(Size),
 }
 
+/// Thickness of the countdown bar under a toast.
+const COUNTDOWN_BAR_HEIGHT: f32 = 3.0;
+
 // Must match the widget durations so task delays align with animation end.
 const SLIDE_ANIMATION: Duration = slide::DEFAULT_DURATION;
 const COLLAPSE_ANIMATION: Duration = collapsible::DEFAULT_DURATION;
@@ -150,8 +154,23 @@ enum DismissPhase {
 /// the pointer leaving the stack spawns a fresh one for each paused toast.
 #[derive(Debug, Clone, Copy)]
 enum ToastTimer {
-    Running { deadline: Instant },
-    Paused { remaining: Duration },
+    Running {
+        deadline: Instant,
+        total: Duration,
+    },
+    Paused {
+        remaining: Duration,
+        total: Duration,
+    },
+}
+
+impl From<ToastTimer> for Countdown {
+    fn from(timer: ToastTimer) -> Self {
+        match timer {
+            ToastTimer::Running { deadline, total } => Self::Running { deadline, total },
+            ToastTimer::Paused { remaining, total } => Self::Paused { remaining, total },
+        }
+    }
 }
 
 pub struct Notifications {
@@ -310,20 +329,31 @@ impl Notifications {
                     if self.toasts_hovered {
                         // The pointer is already over the stack, so this toast
                         // starts paused with its full timeout ahead of it.
-                        self.toast_timers
-                            .insert(notification.id, ToastTimer::Paused { remaining: timeout });
+                        self.toast_timers.insert(
+                            notification.id,
+                            ToastTimer::Paused {
+                                remaining: timeout,
+                                total: timeout,
+                            },
+                        );
                         Task::none()
                     } else {
                         let deadline = Instant::now() + timeout;
-                        let previous = self
-                            .toast_timers
-                            .insert(notification.id, ToastTimer::Running { deadline });
+                        let previous = self.toast_timers.insert(
+                            notification.id,
+                            ToastTimer::Running {
+                                deadline,
+                                total: timeout,
+                            },
+                        );
                         // A running timer always has a sleep in flight, so one is
                         // only needed when there was no timer, when the previous
                         // one was paused, or when the new deadline lands before
                         // the pending wakeup.
                         let needs_sleep = match previous {
-                            Some(ToastTimer::Running { deadline: previous }) => deadline < previous,
+                            Some(ToastTimer::Running {
+                                deadline: previous, ..
+                            }) => deadline < previous,
                             Some(ToastTimer::Paused { .. }) | None => true,
                         };
                         if needs_sleep {
@@ -457,7 +487,7 @@ impl Notifications {
                 let Some(&timer) = self.toast_timers.get(&id) else {
                     return Action::None;
                 };
-                let ToastTimer::Running { deadline } = timer else {
+                let ToastTimer::Running { deadline, .. } = timer else {
                     // Paused under the pointer: the resume spawns a fresh wakeup,
                     // so letting this one go does not strand the toast.
                     return Action::None;
@@ -547,9 +577,10 @@ impl Notifications {
 
                 let now = Instant::now();
                 for timer in self.toast_timers.values_mut() {
-                    if let ToastTimer::Running { deadline } = *timer {
+                    if let ToastTimer::Running { deadline, total } = *timer {
                         *timer = ToastTimer::Paused {
                             remaining: deadline.saturating_duration_since(now),
+                            total,
                         };
                     }
                 }
@@ -567,11 +598,12 @@ impl Notifications {
                     .toast_timers
                     .iter_mut()
                     .filter_map(|(&id, timer)| {
-                        let ToastTimer::Paused { remaining } = *timer else {
+                        let ToastTimer::Paused { remaining, total } = *timer else {
                             return None;
                         };
                         *timer = ToastTimer::Running {
                             deadline: now + remaining,
+                            total,
                         };
                         Some(delayed_toast_message(remaining, id, Message::ExpireToast))
                     })
@@ -645,6 +677,15 @@ impl Notifications {
         }
     }
 
+    /// The countdown to draw under a toast, if it has one to show.
+    fn toast_countdown(&self, id: u32, toast: bool) -> Option<Countdown> {
+        if !toast || !self.config.toast_timeout_bar {
+            return None;
+        }
+
+        self.toast_timers.get(&id).copied().map(Countdown::from)
+    }
+
     fn notification_card<'a>(
         &'a self,
         notification: &'a Notification,
@@ -712,7 +753,23 @@ impl Notifications {
             card = card.max_height(self.config.toast_max_height).clip(true);
         }
 
-        button(card)
+        // Outside the clipped card, so an overflowing body cannot cut the bar
+        // off, and only for toasts that actually expire: a critical or
+        // persistent one has no timer and so has nothing to count down.
+        let content: Element<'a, Message> = match self.toast_countdown(notification.id, toast) {
+            Some(countdown) => {
+                let color = use_theme(|t| t.palette.primary);
+                column!(
+                    card,
+                    countdown_bar(countdown, COUNTDOWN_BAR_HEIGHT, color)
+                        .animated(self.animations_enabled)
+                )
+                .into()
+            }
+            None => card.into(),
+        };
+
+        button(content)
             .on_press(on_press)
             .width(Length::Fill)
             .padding(space.xxs)

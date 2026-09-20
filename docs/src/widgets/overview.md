@@ -9,6 +9,7 @@ ashell includes custom widgets in `src/components/` that provide functionality n
 | [Centerbox](centerbox.md) | `components/centerbox.rs` | Three-column layout that keeps the center truly centered |
 | [PositionButton](position-button.md) | `components/position_button.rs` | Button that reports its screen position on press |
 | [MenuWrapper](menu-wrapper.md) | `components/menu_wrapper.rs` | Menu container with backdrop and click-outside-to-close |
+| [CountdownBar](countdown-bar.md) | `components/countdown_bar.rs` | Self-repainting bar that shrinks as a toast's timeout runs out |
 
 ## ButtonUIRef
 
@@ -31,3 +32,4 @@ iced provides a rich set of built-in widgets (buttons, text, rows, columns, cont
 - **Centerbox**: iced's `Row` doesn't guarantee the center element stays centered when left/right content has different widths.
 - **PositionButton**: Standard iced buttons don't report their screen position, which is needed for menu placement.
 - **MenuWrapper**: No built-in support for modal overlays with backdrop click-to-close.
+- **CountdownBar**: A progress bar built from containers would need the application to tick it; this one asks for its own frames, so a visible toast costs no subscription.

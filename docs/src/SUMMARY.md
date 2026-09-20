@@ -62,6 +62,7 @@
 - [Centerbox](widgets/centerbox.md)
 - [PositionButton](widgets/position-button.md)
 - [MenuWrapper](widgets/menu-wrapper.md)
+- [CountdownBar](widgets/countdown-bar.md)
 
 ---
 
