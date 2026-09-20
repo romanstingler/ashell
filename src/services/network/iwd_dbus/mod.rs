@@ -242,7 +242,17 @@ impl super::NetworkBackend for IwdDbus<'_> {
         &self,
         ap: &AccessPointData,
         password: Option<String>,
+        connect_once: bool,
     ) -> anyhow::Result<()> {
+        // Temporary connections are not implemented for IWD: joining any network
+        // writes /var/lib/iwd/<ssid>.<type>. Undoing that needs the
+        // net.connman.iwd.KnownNetwork { AutoConnect, Forget } lifecycle, tracked in
+        // https://github.com/MalpenZibo/ashell/issues/509. The UI hides the option
+        // for this backend, so this branch should be unreachable.
+        if connect_once {
+            warn!("Temporary connections are unsupported on the IWD backend, connecting normally");
+        }
+
         // Get the agent manager
         let agent_manager = self.agent_manager().await?;
 

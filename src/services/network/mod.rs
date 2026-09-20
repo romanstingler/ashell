@@ -39,10 +39,16 @@ pub trait NetworkBackend: Send + Sync {
 
     /// Connects to a specific access point, potentially with a password.
     /// Returns the updated list of known connections.
+    ///
+    /// When `connect_once` is `true` the connection must be activated without
+    /// persisting a profile to disk, so it disappears again on disconnect. Only
+    /// backends reporting [`NetworkService::supports_temporary_connections`] act
+    /// on the flag; the others connect normally and log a warning.
     async fn select_access_point(
         &self,
         ap: &AccessPointData,
         password: Option<String>,
+        connect_once: bool,
     ) -> anyhow::Result<()>;
 
     async fn known_connections(&self) -> anyhow::Result<Vec<KnownConnection>>;
@@ -80,7 +86,11 @@ pub enum NetworkCommand {
     ScanNearByWiFi,
     ToggleWiFi,
     ToggleAirplaneMode,
-    SelectAccessPoint((AccessPointData, Option<String>)),
+    SelectAccessPoint {
+        access_point: AccessPointData,
+        password: Option<String>,
+        connect_once: bool,
+    },
     ToggleVpn(Vpn),
 }
 
@@ -376,18 +386,19 @@ impl NetworkBackend for BackendChoiceWithConnection {
         &self,
         ap: &AccessPointData,
         password: Option<String>,
+        connect_once: bool,
     ) -> anyhow::Result<()> {
         match self.choice {
             BackendChoice::NetworkManager => {
                 NetworkDbus::new(&self.conn)
                     .await?
-                    .select_access_point(ap, password)
+                    .select_access_point(ap, password, connect_once)
                     .await
             }
             BackendChoice::Iwd => {
                 IwdDbus::new(&self.conn)
                     .await?
-                    .select_access_point(ap, password)
+                    .select_access_point(ap, password, connect_once)
                     .await
             }
         }
@@ -424,6 +435,17 @@ impl NetworkBackend for BackendChoiceWithConnection {
 }
 
 impl NetworkService {
+    /// Whether the active backend can activate a connection without writing a
+    /// profile to disk.
+    ///
+    /// Only NetworkManager, through `AddAndActivateConnection2` with
+    /// `persist = "volatile"`. IWD always creates an entry in
+    /// `/var/lib/iwd`; removing it again needs the `KnownNetwork` lifecycle
+    /// handling tracked in <https://github.com/MalpenZibo/ashell/issues/509>.
+    pub fn supports_temporary_connections(&self) -> bool {
+        matches!(self.backend_choice, BackendChoice::NetworkManager)
+    }
+
     async fn start_listening(state: State, output: &mut Sender<ServiceEvent<Self>>) -> State {
         match state {
             State::Init => match zbus::Connection::system().await {
@@ -669,11 +691,21 @@ impl Service for NetworkService {
                     |wifi_enabled| ServiceEvent::Update(NetworkEvent::WiFiEnabled(wifi_enabled)),
                 )
             }
-            NetworkCommand::SelectAccessPoint((access_point, password)) => Task::perform(
+            NetworkCommand::SelectAccessPoint {
+                access_point,
+                password,
+                connect_once,
+            } => Task::perform(
                 async move {
-                    bc.select_access_point(&access_point, password)
+                    if let Err(err) = bc
+                        .select_access_point(&access_point, password, connect_once)
                         .await
-                        .unwrap_or_default();
+                    {
+                        error!(
+                            "SelectAccessPoint command: failed to activate '{}': {err}",
+                            access_point.ssid
+                        );
+                    }
                     bc.known_connections().await.unwrap_or_default()
                 },
                 |known_connections| {

@@ -89,6 +89,7 @@ impl super::NetworkBackend for NetworkDbus<'_> {
         &self,
         access_point: &AccessPointData,
         password: Option<String>,
+        connect_once: bool,
     ) -> anyhow::Result<()> {
         let settings = NetworkSettingsDbus::new(self.0.inner().connection()).await?;
         let connection = settings.find_connection(&access_point.ssid).await?;
@@ -143,12 +144,31 @@ impl super::NetworkBackend for NetworkDbus<'_> {
                 );
             }
 
-            self.add_and_activate_connection(
-                conn_settings,
-                &access_point.device_path,
-                &access_point.path,
-            )
-            .await?;
+            if connect_once {
+                debug!(
+                    "Activating '{}' as a volatile connection (not persisted to disk)",
+                    access_point.ssid
+                );
+
+                // `persist = "volatile"` keeps the profile in memory only and makes
+                // NetworkManager delete it as soon as the connection goes down.
+                // Never fall back to `add_and_activate_connection` on failure: writing
+                // the profile to disk is exactly what the user asked us not to do.
+                self.add_and_activate_connection2(
+                    conn_settings,
+                    &access_point.device_path,
+                    &access_point.path,
+                    HashMap::from([("persist", Value::Str("volatile".into()))]),
+                )
+                .await?;
+            } else {
+                self.add_and_activate_connection(
+                    conn_settings,
+                    &access_point.device_path,
+                    &access_point.path,
+                )
+                .await?;
+            }
         }
 
         Ok(())
@@ -964,6 +984,23 @@ pub trait NetworkManager {
         device: &ObjectPath<'_>,
         specific_object: &ObjectPath<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath)>;
+
+    /// Same as `AddAndActivateConnection` but takes an extra options dictionary.
+    /// Supported options are `persist` (`disk` by default, `memory` until the daemon
+    /// quits, or `volatile` to delete the profile on disconnect) and
+    /// `bind-activation`. Available since NetworkManager 1.16.
+    #[zbus(name = "AddAndActivateConnection2")]
+    fn add_and_activate_connection2(
+        &self,
+        connection: HashMap<&str, HashMap<&str, Value<'_>>>,
+        device: &ObjectPath<'_>,
+        specific_object: &ObjectPath<'_>,
+        options: HashMap<&str, Value<'_>>,
+    ) -> Result<(
+        OwnedObjectPath,
+        OwnedObjectPath,
+        HashMap<String, OwnedValue>,
+    )>;
 
     fn deactivate_connection(&self, connection: OwnedObjectPath) -> Result<()>;
 
