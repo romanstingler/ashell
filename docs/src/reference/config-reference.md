@@ -11,7 +11,7 @@ Complete reference for all configuration options in `~/.config/ashell/config.tom
 | `position` | `"Top"` \| `"Bottom"` | `"Bottom"` | Bar position on screen |
 | `layer` | `"Top"` \| `"Bottom"` \| `"Overlay"` | `"Bottom"` | Wayland layer (Bottom = below floating windows) |
 | `outputs` | `"All"` \| `"Active"` \| `{ Targets = [...] }` | `"All"` | Which monitors show the bar |
-| `enable_esc_key` | bool | `false` | Whether ESC key closes menus |
+| `enable_esc_key` | bool | `false` | DEPRECATED: whether ESC key closes menus. Use `ashell msg close-all-menus` instead |
 | `osd.enabled` | bool | `false` | Show OSD overlay for IPC volume/brightness/airplane commands |
 | `osd.timeout` | u64 | `1500` | OSD auto-hide delay in milliseconds |
 | `animations.enabled` | bool | `false` | Master toggle for UI animations (bar widths, menu open/close, toast slides, etc.) |

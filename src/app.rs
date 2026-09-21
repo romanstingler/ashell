@@ -305,10 +305,7 @@ impl App {
 
                 Task::batch(cmd)
             }
-            Message::CloseMenu(id) => {
-                self.outputs
-                    .close_menu(id, None, self.general_config.enable_esc_key)
-            }
+            Message::CloseMenu(id) => self.outputs.close_menu(id, None),
             Message::FinishCloseMenu(id) => self.outputs.finish_close_menu(id),
             Message::Custom(name, msg) => {
                 if let Some(custom) = self.custom.get_mut(&name) {
@@ -326,11 +323,7 @@ impl App {
                         }
                         modules::updates::Action::CloseMenu(id, task) => Task::batch(vec![
                             task.map(Message::Updates),
-                            self.outputs.close_menu(
-                                id,
-                                Some(MenuType::Updates),
-                                self.general_config.enable_esc_key,
-                            ),
+                            self.outputs.close_menu(id, Some(MenuType::Updates)),
                         ]),
                     }
                 } else {
@@ -365,14 +358,13 @@ impl App {
                     )
                 }
                 modules::tray::Action::TrayMenuCommand(task) => Task::batch(vec![
-                    self.outputs
-                        .close_all_menus(self.general_config.enable_esc_key),
+                    self.outputs.close_all_menus(),
                     task.map(Message::Tray),
                 ]),
                 modules::tray::Action::TrayMenuCommandKeepOpen(task) => task.map(Message::Tray),
-                modules::tray::Action::CloseTrayMenu(name) => self
-                    .outputs
-                    .close_all_menu_if(MenuType::Tray(name), self.general_config.enable_esc_key),
+                modules::tray::Action::CloseTrayMenu(name) => {
+                    self.outputs.close_all_menu_if(MenuType::Tray(name))
+                }
             },
             Message::Tempo(message) => match self.tempo.update(message) {
                 modules::tempo::Action::None => Task::none(),
@@ -384,10 +376,7 @@ impl App {
             Message::Settings(message) => match self.settings.update(message) {
                 modules::settings::Action::None => Task::none(),
                 modules::settings::Action::Command(task) => task.map(Message::Settings),
-                modules::settings::Action::CloseMenu(id) => {
-                    self.outputs
-                        .close_menu(id, None, self.general_config.enable_esc_key)
-                }
+                modules::settings::Action::CloseMenu(id) => self.outputs.close_menu(id, None),
                 modules::settings::Action::RequestKeyboardWithCommand(id, task) => {
                     Task::batch(vec![
                         task.map(Message::Settings),
@@ -404,9 +393,9 @@ impl App {
                 modules::settings::Action::OpenTooltipMenu(id, menu_type, ui_ref) => {
                     self.outputs.toggle_menu(id, menu_type, ui_ref, false)
                 }
-                modules::settings::Action::CloseTooltipMenu(id, menu_type) => self
-                    .outputs
-                    .close_menu(id, Some(menu_type), self.general_config.enable_esc_key),
+                modules::settings::Action::CloseTooltipMenu(id, menu_type) => {
+                    self.outputs.close_menu(id, Some(menu_type))
+                }
             },
             Message::OutputEvent(event) => match event {
                 OutputEvent::Added(info) => {
@@ -469,8 +458,7 @@ impl App {
             },
             Message::CloseAllMenus => {
                 if self.outputs.menu_is_open() {
-                    self.outputs
-                        .close_all_menus(self.general_config.enable_esc_key)
+                    self.outputs.close_all_menus()
                 } else {
                     Task::none()
                 }
@@ -529,6 +517,12 @@ impl App {
                     IpcCommand::ToggleVisibility => {
                         warn!(
                             "IpcCommand::ToggleVisibility reached IpcOsdCommand handler; use Message::ToggleVisibility instead"
+                        );
+                        modules::settings::Action::None
+                    }
+                    IpcCommand::CloseAllMenus => {
+                        warn!(
+                            "IpcCommand::CloseAllMenus reached IpcOsdCommand handler; use Message::CloseAllMenus instead"
                         );
                         modules::settings::Action::None
                     }
@@ -731,9 +725,12 @@ impl App {
                 _ => Message::None,
             }),
             iced::output_events().map(Message::OutputEvent),
-            // Only listen while Escape can close a menu; an idle listener
+            // Legacy Escape listener gated by the deprecated `enable_esc_key`
+            // setting. The recommended way to close menus from a keybind is
+            // the `close-all-menus` IPC command instead. An idle listener
             // subscription still receives every interaction event and would
-            // overflow iced's fixed-size event channel for nothing.
+            // overflow iced's fixed-size event channel for nothing, so we
+            // only subscribe while a menu is actually open.
             if self.general_config.enable_esc_key && self.outputs.menu_is_open() {
                 listen_with(|evt, _, _| match evt {
                     iced::event::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
@@ -770,6 +767,7 @@ impl App {
             self.settings.subscription().map(Message::Settings),
             crate::ipc::subscription().map(|cmd| match cmd {
                 IpcCommand::ToggleVisibility => Message::ToggleVisibility,
+                IpcCommand::CloseAllMenus => Message::CloseAllMenus,
                 other => Message::IpcOsdCommand(other),
             }),
         ])

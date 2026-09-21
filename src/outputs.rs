@@ -676,17 +676,13 @@ impl Outputs {
             _ => Task::none(),
         };
 
-        if request_keyboard {
-            if self.menu_needs_keyboard() {
-                Task::batch(vec![
-                    task,
-                    set_keyboard_interactivity(id, KeyboardInteractivity::OnDemand),
-                ])
-            } else {
-                self.maybe_release_all_keyboards(task, request_keyboard)
-            }
+        if request_keyboard && self.menu_needs_keyboard() {
+            Task::batch(vec![
+                task,
+                set_keyboard_interactivity(id, KeyboardInteractivity::OnDemand),
+            ])
         } else {
-            task
+            self.maybe_release_all_keyboards(task)
         }
     }
 
@@ -694,9 +690,8 @@ impl Outputs {
     fn maybe_release_all_keyboards(
         &self,
         task: Task<crate::app::Message>,
-        esc_button_enabled: bool,
     ) -> Task<crate::app::Message> {
-        if esc_button_enabled && !self.menu_needs_keyboard() {
+        if !self.menu_needs_keyboard() {
             let keyboard_tasks = self
                 .entries
                 .iter()
@@ -716,7 +711,6 @@ impl Outputs {
         &mut self,
         id: SurfaceId,
         menu_type: Option<MenuType>,
-        esc_button_enabled: bool,
     ) -> Task<crate::app::Message> {
         let task = match self.find_by_surface_id_mut(id) {
             Some((_, Some(shell_info), _)) => match menu_type {
@@ -726,14 +720,10 @@ impl Outputs {
             _ => Task::none(),
         };
 
-        self.maybe_release_all_keyboards(task, esc_button_enabled)
+        self.maybe_release_all_keyboards(task)
     }
 
-    pub fn close_all_menu_if(
-        &mut self,
-        menu_type: MenuType,
-        esc_button_enabled: bool,
-    ) -> Task<crate::app::Message> {
+    pub fn close_all_menu_if(&mut self, menu_type: MenuType) -> Task<crate::app::Message> {
         let task = Task::batch(
             self.entries
                 .iter_mut()
@@ -745,10 +735,10 @@ impl Outputs {
                 .collect::<Vec<_>>(),
         );
 
-        self.maybe_release_all_keyboards(task, esc_button_enabled)
+        self.maybe_release_all_keyboards(task)
     }
 
-    pub fn close_all_menus(&mut self, esc_button_enabled: bool) -> Task<crate::app::Message> {
+    pub fn close_all_menus(&mut self) -> Task<crate::app::Message> {
         let task = Task::batch(
             self.entries
                 .iter_mut()
@@ -761,7 +751,7 @@ impl Outputs {
                 .collect::<Vec<_>>(),
         );
 
-        self.maybe_release_all_keyboards(task, esc_button_enabled)
+        self.maybe_release_all_keyboards(task)
     }
 
     pub fn request_keyboard<Message: 'static>(&self, id: SurfaceId) -> Task<Message> {

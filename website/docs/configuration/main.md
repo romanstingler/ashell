@@ -164,23 +164,35 @@ position = "Bottom"
 layer = "Bottom"
 ```
 
-## Close menu with esc
+## Close menus
 
-You can enable the use of the `Esc` key to close the menu.
+You can close any open menu from a compositor keybind or a script using the
+built-in IPC socket:
 
-:::warning
+```bash
+ashell msg close-all-menus
+```
 
-With these features enabled, ashell will use the keyboard
-in an exclusive way when a menu is open.
+Bind it to whatever key you like. For Hyprland:
 
-This means other applications will not be able to use
-the keyboard when the menu is open.
+```toml
+bind = SUPER, ESCAPE, exec, ashell msg close-all-menus
+```
 
-:::
+:::warning[Deprecated]
+
+The `enable_esc_key` setting is deprecated, use `ashell msg close-all-menus`
+instead.
+
+With that setting enabled, ashell uses the keyboard in an exclusive way when a
+menu is open. This means other applications will not be able to use the
+keyboard while the menu is open.
 
 ```toml
 enable_esc_key = true
 ```
+
+:::
 
 ## Visibility Toggle
 

@@ -15,7 +15,7 @@ Commented-out lines show the default; uncomment and change to customize.
 # outputs = "All"            # "All" (default), "Active", or { Targets = ["eDP-1"] }
 position = "Top"             # "Top" (default) or "Bottom"
 # layer = "Bottom"           # "Bottom" (default), "Top", or "Overlay"
-# enable_esc_key = false     # Pressing Escape closes open menus
+# enable_esc_key = false     # DEPRECATED: press Esc to close menus
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 

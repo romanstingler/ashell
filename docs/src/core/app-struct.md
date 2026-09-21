@@ -40,7 +40,7 @@ pub struct GeneralConfig {
     outputs: config::Outputs,     // Which monitors to show the bar on
     pub modules: Modules,         // Left/center/right module layout
     pub layer: config::Layer,     // Wayland layer (Top/Bottom/Overlay)
-    enable_esc_key: bool,         // Whether ESC closes menus
+    enable_esc_key: bool,         // DEPRECATED: whether ESC closes menus
 }
 ```
 

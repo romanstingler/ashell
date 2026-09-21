@@ -76,6 +76,7 @@ Available commands:
 | Command                  | Description                          |
 | ------------------------ | ------------------------------------ |
 | `toggle-visibility`      | Toggle the bar on/off                |
+| `close-all-menus`        | Close any open menus                 |
 | `volume-up`              | Increase sink volume by 5%           |
 | `volume-down`            | Decrease sink volume by 5%           |
 | `volume-toggle-mute`     | Toggle sink mute                     |

@@ -117,6 +117,12 @@ impl Config {
         self.tempo.validate();
         self.settings.validate();
         self.media_player.validate();
+        if self.enable_esc_key {
+            warn!(
+                "enable_esc_key is deprecated. Bind the Esc key on the \
+                 compositor side instead, e.g. `ashell msg close-all-menus`."
+            );
+        }
     }
 }
 

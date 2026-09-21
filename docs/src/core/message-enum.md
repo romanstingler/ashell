@@ -84,4 +84,7 @@ Emitted by the logind service when the system wakes from sleep. Used to refresh 
 
 ### CloseAllMenus
 
-Emitted when all menus should close (e.g., when the ESC key is pressed with `enable_esc_key = true`).
+Emitted when all menus should close. This is now primarily triggered by the
+`close-all-menus` IPC command (`ashell msg close-all-menus`), the
+recommended replacement for the deprecated `enable_esc_key` Escape
+listener.

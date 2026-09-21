@@ -24,6 +24,8 @@ const MAX_REQUEST_LEN: u64 = 4096;
 pub enum IpcCommand {
     /// Toggle bar visibility
     ToggleVisibility,
+    /// Close any open menu
+    CloseAllMenus,
     VolumeUp {
         #[arg(long)]
         no_osd: bool,
@@ -70,6 +72,7 @@ impl IpcCommand {
     pub fn no_osd(&self) -> bool {
         match self {
             IpcCommand::ToggleVisibility => false,
+            IpcCommand::CloseAllMenus => false,
             IpcCommand::VolumeUp { no_osd }
             | IpcCommand::VolumeDown { no_osd }
             | IpcCommand::VolumeToggleMute { no_osd }
@@ -90,6 +93,7 @@ impl fmt::Display for IpcCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let base = match self {
             IpcCommand::ToggleVisibility => "toggle-visibility",
+            IpcCommand::CloseAllMenus => "close-all-menus",
             IpcCommand::VolumeUp { .. } => "volume-up",
             IpcCommand::VolumeDown { .. } => "volume-down",
             IpcCommand::VolumeToggleMute { .. } => "volume-toggle-mute",
@@ -119,6 +123,7 @@ impl FromStr for IpcCommand {
         };
         match cmd {
             "toggle-visibility" => Ok(IpcCommand::ToggleVisibility),
+            "close-all-menus" => Ok(IpcCommand::CloseAllMenus),
             "volume-up" => Ok(IpcCommand::VolumeUp { no_osd }),
             "volume-down" => Ok(IpcCommand::VolumeDown { no_osd }),
             "volume-toggle-mute" => Ok(IpcCommand::VolumeToggleMute { no_osd }),
