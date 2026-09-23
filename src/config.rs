@@ -456,8 +456,10 @@ pub enum ToastPosition {
     TopLeft,
     #[default]
     TopRight,
+    TopCenter,
     BottomLeft,
     BottomRight,
+    BottomCenter,
 }
 
 #[derive(Deserialize, Clone, Debug)]
