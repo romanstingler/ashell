@@ -27,7 +27,8 @@ use libpulse_binding::{
 use log::{debug, error, trace, warn};
 use std::{
     any::TypeId,
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    collections::HashSet,
     fmt,
     ops::{Deref, DerefMut},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -528,9 +529,20 @@ impl PulseAudioServer {
                         },
                     );
 
+                    // PipeWire's session manager already moves running streams when the
+                    // default device changes, and an explicit move would pin them there.
+                    // Native PulseAudio does neither, so ashell moves them itself.
+                    let native_pulse = Rc::new(Cell::new(false));
                     match server.wait_for_response(server.introspector.get_server_info({
                         let tx = from_server_tx.clone();
+                        let native_pulse = native_pulse.clone();
                         move |info| {
+                            native_pulse.set(
+                                !info
+                                    .server_name
+                                    .as_deref()
+                                    .is_some_and(|name| name.contains("PipeWire")),
+                            );
                             Self::send_server_info(info, &tx);
                         }
                     })) {
@@ -668,12 +680,26 @@ impl PulseAudioServer {
                                     if let Some(port) = port {
                                         cmd_introspector.set_sink_port_by_name(&name, &port, None);
                                     }
+                                    if native_pulse.get() {
+                                        Self::move_sink_inputs(
+                                            &cmd_introspector,
+                                            server.context.introspect(),
+                                            name,
+                                        );
+                                    }
                                 }
                                 PulseAudioCommand::DefaultSource(name, port) => {
                                     server.context.set_default_source(&name, |_| {});
                                     if let Some(port) = port {
                                         cmd_introspector
                                             .set_source_port_by_name(&name, &port, None);
+                                    }
+                                    if native_pulse.get() {
+                                        Self::move_source_outputs(
+                                            &cmd_introspector,
+                                            server.context.introspect(),
+                                            name,
+                                        );
                                     }
                                 }
                             }
@@ -719,6 +745,61 @@ impl PulseAudioServer {
         }
 
         Ok(())
+    }
+
+    /// Moves every client playback stream to `sink`. Streams created by modules
+    /// (loopbacks, echo cancel, combine sinks) are left alone.
+    fn move_sink_inputs(introspector: &Introspector, mut mover: Introspector, sink: String) {
+        introspector.get_sink_input_info_list(move |info| {
+            if let ListResult::Item(input) = info
+                && input.owner_module.is_none()
+            {
+                let index = input.index;
+                mover.move_sink_input_by_name(
+                    index,
+                    &sink,
+                    Some(Box::new(move |ok| {
+                        if !ok {
+                            debug!("Failed to move sink input {index}");
+                        }
+                    })),
+                );
+            }
+        });
+    }
+
+    /// Moves every client recording stream to `source`, except the ones recording a
+    /// monitor source, which capture sink output on purpose.
+    fn move_source_outputs(introspector: &Introspector, mut mover: Introspector, source: String) {
+        let monitors = Rc::new(RefCell::new(HashSet::new()));
+        introspector.get_source_info_list({
+            let monitors = monitors.clone();
+            move |info| {
+                if let ListResult::Item(source) = info
+                    && source.monitor_of_sink.is_some()
+                {
+                    monitors.borrow_mut().insert(source.index);
+                }
+            }
+        });
+        // Replies arrive in request order, so the monitor set is complete by now.
+        introspector.get_source_output_info_list(move |info| {
+            if let ListResult::Item(output) = info
+                && output.owner_module.is_none()
+                && !monitors.borrow().contains(&output.source)
+            {
+                let index = output.index;
+                mover.move_source_output_by_name(
+                    index,
+                    &source,
+                    Some(Box::new(move |ok| {
+                        if !ok {
+                            debug!("Failed to move source output {index}");
+                        }
+                    })),
+                );
+            }
+        });
     }
 
     fn send_server_info(

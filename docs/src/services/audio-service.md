@@ -75,4 +75,6 @@ The audio service implements the `Service` trait with these commands:
 
 Most modern Linux distributions use PipeWire, which provides a PulseAudio-compatible API. ashell's audio service works transparently with both PulseAudio and PipeWire — no code changes needed.
 
+One difference: when the default device changes, PipeWire's session manager moves running streams to it, but native PulseAudio does not. On native PulseAudio (detected from the server name), setting a default sink or source also moves the running client streams to it. Streams owned by modules (loopbacks, echo cancel) and recordings of monitor sources are left where they are. On PipeWire ashell skips this, because an explicit move would pin the stream and stop it from following later default changes.
+
 The `privacy.rs` service separately uses PipeWire's portal API for detecting active microphone/camera/screenshare sessions.
