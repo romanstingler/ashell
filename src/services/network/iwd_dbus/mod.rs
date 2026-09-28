@@ -246,8 +246,14 @@ impl super::NetworkBackend for IwdDbus<'_> {
         // Get the agent manager
         let agent_manager = self.agent_manager().await?;
 
+        let net = NetworkProxy::builder(self.inner().connection())
+            .destination("net.connman.iwd")?
+            .path(ap.path.clone())?
+            .build()
+            .await?;
+
         // If password is provided, register a new agent to handle it
-        if let Some(p) = password {
+        let agent_path = if let Some(p) = password {
             let path = OwnedObjectPath::try_from("/ashell/pwagent/main")
                 .expect("hardcoded valid D-Bus object path");
 
@@ -256,29 +262,46 @@ impl super::NetworkBackend for IwdDbus<'_> {
                 Err(e) => info!("Failed to unregister agent at {path}: {e}"),
             }
 
-            // Create a new agent with the password
             let (tx, password_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-            // Register the new agent
-            let pw_agent = PWAgent { password_rx };
-            self.inner()
-                .connection()
-                .object_server()
-                .at(path.clone(), pw_agent)
-                .await?;
+            // `ObjectServer::at` reports an already exported interface as `Ok(false)`
+            // instead of replacing it, so an agent left behind by a connect that failed
+            // before its teardown has to be removed first. Fails with
+            // `InterfaceNotFound` when nothing is exported, which is the normal case.
+            let server = self.inner().connection().object_server();
+            let _ = server.remove::<PWAgent, _>(&path).await;
+            if !server.at(&path, PWAgent { password_rx }).await? {
+                anyhow::bail!("stale passphrase agent still exported at {path}");
+            }
+
+            // Queue the passphrase before registering the agent with iwd.
+            tx.send(p)?;
 
             agent_manager.register_agent(&path).await?;
 
-            // Send the password to the agent channel
-            tx.send(p)?;
+            Some(path)
+        } else {
+            None
+        };
+
+        let result = net.connect().await;
+
+        // The agent only exists to answer the `RequestPassphrase` call of this
+        // connect, and its channel is spent once that call has been served, so it
+        // must not stay registered with iwd for the rest of the session.
+        if let Some(path) = agent_path {
+            if let Err(e) = agent_manager.unregister_agent(&path).await {
+                debug!("Failed to unregister agent at {path}: {e}");
+            }
+            let _ = self
+                .inner()
+                .connection()
+                .object_server()
+                .remove::<PWAgent, _>(&path)
+                .await;
         }
 
-        let net = NetworkProxy::builder(self.inner().connection())
-            .destination("net.connman.iwd")?
-            .path(ap.path.clone())?
-            .build()
-            .await?;
-        net.connect().await?;
+        result?;
         Ok(())
     }
 
