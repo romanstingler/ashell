@@ -401,11 +401,14 @@ pub async fn fetch_location(location: &WeatherLocation, lang: &str) -> anyhow::R
 
     match location {
         WeatherLocation::City(city) => {
-            let url = format!(
-                "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language={}&format=json",
-                city, lang
-            );
-            let response = client.get(&url).send().await?;
+            let mut url = reqwest::Url::parse("https://geocoding-api.open-meteo.com/v1/search")?;
+            url.query_pairs_mut()
+                .append_pair("name", city)
+                .append_pair("count", "1")
+                .append_pair("language", lang)
+                .append_pair("format", "json");
+
+            let response = client.get(url).send().await?;
             let raw_data = response.text().await?;
 
             let data: GeoLocations = serde_json::from_str(&raw_data)?;
@@ -451,13 +454,15 @@ async fn try_reverse_geocode(
     lon: f32,
     lang: &str,
 ) -> anyhow::Result<Option<(String, String)>> {
-    let url = format!(
-        "https://nominatim.openstreetmap.org/reverse?format=json&lat={}&lon={}&accept-language={}",
-        lat, lon, lang
-    );
+    let mut url = reqwest::Url::parse("https://nominatim.openstreetmap.org/reverse")?;
+    url.query_pairs_mut()
+        .append_pair("format", "json")
+        .append_pair("lat", &lat.to_string())
+        .append_pair("lon", &lon.to_string())
+        .append_pair("accept-language", lang);
 
     let response = client
-        .get(&url)
+        .get(url)
         .header("User-Agent", "ashell")
         .send()
         .await?;
