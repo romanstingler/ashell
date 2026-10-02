@@ -1,5 +1,8 @@
+use std::{fmt::Write as _, sync::Once};
+
 use chrono::{
-    Datelike, Days, FixedOffset, Local, Months, NaiveDate, NaiveDateTime, TimeZone, Utc, Weekday,
+    DateTime, Datelike, Days, FixedOffset, Local, Locale, Months, NaiveDate, NaiveDateTime,
+    TimeZone, Utc, Weekday,
 };
 use chrono_tz::Tz;
 use iced::{
@@ -7,6 +10,7 @@ use iced::{
     alignment::{Horizontal, Vertical},
     widget::{Column, Row, column, container, row, text},
 };
+use log::warn;
 
 use crate::{
     components::{
@@ -19,6 +23,36 @@ use crate::{
 };
 
 use super::{Message, Tempo};
+
+/// Stand-in for a format chrono refuses to render. Plain numeric specifiers only,
+/// so it is valid in every locale.
+const FALLBACK_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// chrono reports an unusable specifier through a `Display` error, which
+/// `to_string` turns into a panic. Render fallibly and fall back instead of
+/// taking the whole bar down over a bad `clock_format`.
+fn format_time<T>(date: &DateTime<T>, format: &str, locale: Locale) -> String
+where
+    T: TimeZone,
+    T::Offset: std::fmt::Display,
+{
+    let mut rendered = String::new();
+
+    if write!(rendered, "{}", date.format_localized(format, locale)).is_ok() {
+        return rendered;
+    }
+
+    // the clock renders on every tick, so complain once per process
+    WARN_ONCE.call_once(|| {
+        warn!("cannot render clock format {format:?} in locale {locale}, using {FALLBACK_TIME_FORMAT:?}");
+    });
+
+    let mut fallback = String::new();
+    let _ = write!(fallback, "{}", date.format(FALLBACK_TIME_FORMAT));
+    fallback
+}
+
+static WARN_ONCE: Once = Once::new();
 
 impl Tempo {
     pub(super) fn time_str(
@@ -37,30 +71,24 @@ impl Tempo {
             .get(timezone_index)
             .and_then(|tz_name| {
                 if !format_requests_name && let Ok(offset) = tz_name.parse::<FixedOffset>() {
-                    return Some(
-                        offset
-                            .from_utc_datetime(&naive_utc)
-                            .format_localized(format, locale)
-                            .to_string(),
-                    );
+                    return Some(format_time(
+                        &offset.from_utc_datetime(&naive_utc),
+                        format,
+                        locale,
+                    ));
                 }
 
                 if let Ok(tz) = tz_name.parse::<Tz>() {
-                    return Some(
-                        tz.from_utc_datetime(&naive_utc)
-                            .format_localized(format, locale)
-                            .to_string(),
-                    );
+                    return Some(format_time(
+                        &tz.from_utc_datetime(&naive_utc),
+                        format,
+                        locale,
+                    ));
                 }
 
                 None
             })
-            .unwrap_or_else(|| {
-                Local
-                    .from_utc_datetime(&naive_utc)
-                    .format_localized(format, locale)
-                    .to_string()
-            })
+            .unwrap_or_else(|| format_time(&Local.from_utc_datetime(&naive_utc), format, locale))
     }
 
     pub(super) fn naive_date(&'_ self, timezone_index: usize) -> NaiveDate {
@@ -267,5 +295,41 @@ impl Tempo {
         .spacing(theme.space.lg)
         .width(225)
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{TempoModuleConfig, WeatherIndicator};
+
+    fn tempo_with(clock_format: &str) -> Tempo {
+        Tempo::new(TempoModuleConfig {
+            clock_format: clock_format.to_owned(),
+            formats: vec![],
+            timezones: vec!["Europe/Vienna".to_owned()],
+            weather_location: None,
+            weather_indicator: WeatherIndicator::default(),
+            wind_speed_unit: None,
+        })
+    }
+
+    #[test]
+    fn renders_the_configured_format() {
+        let rendered = tempo_with("%H:%M").time_str("%H:%M", 0, None);
+
+        assert_eq!(rendered.len(), "12:34".len());
+    }
+
+    /// chrono rejects specifiers it does not know through a `Display` error,
+    /// which used to panic inside `to_string` and take the bar down.
+    #[test]
+    fn unknown_specifier_falls_back_instead_of_panicking() {
+        let rendered = tempo_with("%N").time_str("%N", 0, None);
+
+        assert!(
+            rendered.starts_with("20"),
+            "unexpected fallback: {rendered}"
+        );
     }
 }
