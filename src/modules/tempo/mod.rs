@@ -23,6 +23,59 @@ use crate::{
 
 pub use self::weather::weather_icon;
 
+/// chrono specifiers whose output changes at least once per second, so a format
+/// containing any of them has to be refreshed every second. Every other
+/// specifier chrono supports was checked and left out.
+///
+/// `%c`, `%X` and `%r` are listed as if they always carry seconds even though a
+/// few locales render them without: a redundant 1 s tick is harmless, a missing
+/// one is a visible bug.
+const SECOND_SPECIFIERS: [&str; 15] = [
+    "%S",  // seconds
+    "%T",  // %H:%M:%S
+    "%X",  // locale time representation, with seconds
+    "%r",  // 12-hour clock time, with seconds
+    "%c",  // locale date and time, with seconds
+    "%+",  // ISO 8601 / RFC 3339, with seconds
+    "%s",  // seconds since epoch
+    "%f",  // nanoseconds, also covers ".%f"
+    "%.f", // nanoseconds, left aligned
+    "%3f", // milliseconds
+    "%6f", // microseconds
+    "%9f", // nanoseconds
+    "%.3f", "%.6f", "%.9f", // the left aligned fractional variants
+];
+
+/// Whether `format` contains a specifier that changes at least once per second.
+fn shows_seconds(format: &str) -> bool {
+    let mut rest = format;
+
+    while let Some(percent) = rest.find('%') {
+        let after = &rest[percent + 1..];
+
+        // `%%` is an escaped percent sign, not the start of a specifier.
+        if let Some(literal) = after.strip_prefix('%') {
+            rest = literal;
+            continue;
+        }
+
+        // chrono accepts the glibc padding flags on numeric specifiers, so `%-S`
+        // and `%_s` mean the same as `%S` and `%s`. Skip them before matching.
+        let specifier = after.trim_start_matches(['-', '_', '0']);
+
+        if SECOND_SPECIFIERS
+            .iter()
+            .any(|candidate| specifier.starts_with(&candidate[1..]))
+        {
+            return true;
+        }
+
+        rest = specifier;
+    }
+
+    false
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Update,
@@ -220,21 +273,8 @@ impl Tempo {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let second_specifiers = [
-            "%S",  // Seconds (00-60)
-            "%T",  // Hour:Minute:Second
-            "%X",  // Locale time representation with seconds
-            "%r",  // 12-hour clock time with seconds
-            "%:z", // UTC offset with seconds
-            "%s",  // Seconds since epoch
-        ];
-
         let current_format = self.current_format();
-
-        let interval = if second_specifiers
-            .iter()
-            .any(|&spec| current_format.contains(spec))
-        {
+        let interval = if shows_seconds(current_format) {
             Duration::from_secs(1)
         } else {
             Duration::from_secs(5)
