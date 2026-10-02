@@ -25,7 +25,7 @@ forecast, and a seven-day outlook.
 | `clock_format`      | `string` | `%a %d %b %R`        | Strftime-compatible format used for the clock in the bar and in the menu header. See the [chrono formatting guide](https://docs.rs/chrono/latest/chrono/format/strftime/index.html) for placeholders.                                            |
 | `formats`           | `array`  | `[]`                 | Multiple datetime formats that can be cycled through by right-clicking the clock. When provided, right-clicking cycles through each format in sequence and `clock_format` is ignored.                                                                                                |
 | `timezones`         | `array`  | `[]`                 | Timezone identifiers that can be cycled through by scrolling. Supports both IANA names (e.g., `"UTC"`, `"America/New_York"`) and fixed offsets (e.g., `"+00:00"`, `"-05:00"`).                                                                   |
-| `weather_location`  | `enum`   | *unset*              | Determines which coordinates are queried when requesting weather data. `Current` geo-locates via IP using `ip-api.com`. Use the `City` variant to pin the module to a specific place. Use `Coordinates` to specify exact latitude and longitude. |
+| `weather_location`  | `enum`   | *unset*              | Determines which coordinates are queried when requesting weather data. `Current` geo-locates via IP using `ipwho.is`. Use the `City` variant to pin the module to a specific place. Use `Coordinates` to specify exact latitude and longitude. |
 | `weather_indicator` | `enum`   | `IconAndTemperature` | Determines what information about the weather is shown in the bar, valid options are `None`, `Icon`, and `IconAndTemperature`.                                                                                                                   |
 | `wind_speed_unit`   | `string` | *unset*              | Override wind speed unit for both display and API requests. Options: `"Kmh"`, `"Mph"`, `"Ms"`. When omitted, derives from locale (Metric → `Kmh`, Imperial → `Mph`). Temperature unit is not affected.                                           |
 
@@ -158,7 +158,7 @@ is a parse error that makes ashell fall back to the *entire* default config.
 
 ## Networking & privacy
 
-- Tempo fetches location data either from `ip-api.com` (for `Current`), from Open-Meteo's geocoding endpoint (for
+- Tempo fetches location data either from `ipwho.is` (for `Current`), from Open-Meteo's geocoding endpoint (for
   `City`), or uses reverse geocoding from Nominatim (OpenStreetMap) to get location names for `Coordinates`.
 - Weather observations and forecasts are requested from the Open-Meteo API every 30 minutes. Ensure `ashell` has network
   access.

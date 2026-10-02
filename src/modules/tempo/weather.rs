@@ -346,23 +346,43 @@ impl From<GeoLocation> for Location {
     }
 }
 
+/// Response of `https://ipwho.is/`, a free HTTPS IP geolocation service.
+/// On lookup failure the service still answers with HTTP 200 and
+/// `success: false` plus a `message`, so both have to be checked.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IpLocation {
-    lat: f32,
-    lon: f32,
-    city: String,
-    region_name: String,
+struct IpLocation {
+    success: bool,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    latitude: Option<f32>,
+    #[serde(default)]
+    longitude: Option<f32>,
+    #[serde(default)]
+    city: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
 }
 
-impl From<IpLocation> for Location {
-    fn from(value: IpLocation) -> Self {
-        Location {
-            latitude: value.lat,
-            longitude: value.lon,
-            city: value.city,
-            region_name: value.region_name,
+impl IpLocation {
+    fn into_location(self) -> anyhow::Result<Location> {
+        if !self.success {
+            anyhow::bail!(
+                "IP geolocation lookup failed: {}",
+                self.message.as_deref().unwrap_or("unknown error")
+            );
         }
+
+        Ok(Location {
+            latitude: self
+                .latitude
+                .ok_or_else(|| anyhow::anyhow!("IP geolocation returned no latitude"))?,
+            longitude: self
+                .longitude
+                .ok_or_else(|| anyhow::anyhow!("IP geolocation returned no longitude"))?,
+            city: self.city.unwrap_or_default(),
+            region_name: self.region.unwrap_or_default(),
+        })
     }
 }
 
@@ -397,14 +417,17 @@ pub async fn fetch_location(location: &WeatherLocation, lang: &str) -> anyhow::R
                 .map(|l| l.into())
         }
         WeatherLocation::Current => {
-            let find_location = "http://ip-api.com/json/";
-
-            let response = client.get(find_location).send().await?;
+            let response = client
+                .get("https://ipwho.is/")
+                .header("User-Agent", "ashell")
+                .send()
+                .await?
+                .error_for_status()?;
             let raw_data = response.text().await?;
 
             let data: IpLocation = serde_json::from_str(&raw_data)?;
 
-            Ok(data.into())
+            data.into_location()
         }
         WeatherLocation::Coordinates(lat, lon) => {
             let (city, region_name) = match try_reverse_geocode(&client, *lat, *lon, lang).await {
