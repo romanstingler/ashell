@@ -415,12 +415,19 @@ static HTTP_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> = LazyLock
 
 /// Sends a GET request and returns the response body. Fails on any non-2xx
 /// status and on bodies larger than `MAX_RESPONSE_BYTES`.
+///
+/// Errors never carry the request URL: its query holds the user's
+/// coordinates or city, and these errors end up in the warn-level log.
 async fn get_text(url: reqwest::Url) -> anyhow::Result<String> {
     let client = HTTP_CLIENT
         .as_ref()
         .map_err(|e| anyhow::anyhow!("failed to build the HTTP client: {e}"))?;
 
-    let mut response = client.get(url).send().await?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
 
     let status = response.status();
     if !status.is_success() {
@@ -428,7 +435,11 @@ async fn get_text(url: reqwest::Url) -> anyhow::Result<String> {
     }
 
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)?
+    {
         if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
             anyhow::bail!("response body exceeds {MAX_RESPONSE_BYTES} bytes");
         }

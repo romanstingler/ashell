@@ -11,7 +11,7 @@ use iced::{
     stream::channel,
     widget::{container, text},
 };
-use log::{debug, warn};
+use log::{debug, trace, warn};
 
 use self::weather::{Location, WeatherData, fetch_location, fetch_weather_data};
 use crate::{
@@ -268,7 +268,8 @@ impl Tempo {
                     loop {
                         let loc = match fetch_location(&location, &lang).await {
                             Ok(loc) => {
-                                debug!("Location fetched successfully: {:?}", loc);
+                                debug!("Location fetched successfully");
+                                trace!("Location: {:?}", loc);
                                 let (lat, lon) = (loc.latitude, loc.longitude);
                                 output.send(Message::UpdateLocation(loc)).await.ok();
                                 Some((lat, lon))
@@ -283,7 +284,8 @@ impl Tempo {
                             match fetch_weather_data(lat, lon, units, wind_unit).await {
                                 Ok(weather_data) => {
                                     failed_attempt = 0;
-                                    debug!("Weather data fetched successfully: {:?}", weather_data);
+                                    debug!("Weather data fetched successfully");
+                                    trace!("Weather data: {:?}", weather_data);
                                     output
                                         .send(Message::UpdateWeather(Box::new(weather_data)))
                                         .await
