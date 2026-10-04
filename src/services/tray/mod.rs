@@ -7,20 +7,31 @@ use dbus::{
 use iced::{
     Subscription, Task,
     futures::{
-        SinkExt, Stream, StreamExt,
+        FutureExt, SinkExt, StreamExt,
         channel::mpsc::Sender,
-        stream::{pending, select_all},
-        stream_select,
+        future::BoxFuture,
+        stream::{AbortHandle, BoxStream, FuturesUnordered, SelectAll, abortable, pending},
     },
     stream::channel,
     widget::image,
 };
-use log::{debug, error, info, trace};
-use std::{any::TypeId, ops::Deref};
+use log::{debug, error, info, trace, warn};
+use std::{any::TypeId, collections::HashMap, ops::Deref, time::Duration};
 
 pub mod dbus;
 
 pub type TrayIcon = super::xdg_icons::XdgIcon;
+
+/// Delays before retrying an item that failed to load. Some clients call
+/// `RegisterStatusNotifierItem` before exporting the object.
+const ITEM_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
+
+/// Upper bound for the backoff between host restarts after a failure.
+const MAX_HOST_BACKOFF: Duration = Duration::from_secs(30);
 
 fn pixmap_to_icon(icons: Vec<dbus::Icon>) -> Option<TrayIcon> {
     icons
@@ -89,6 +100,24 @@ fn split_service_name(name: &str) -> (&str, &str) {
         None => (name, "/StatusNotifierItem"),
     }
 }
+
+/// The object answered but has no such property. Qt and GDBus reply
+/// `InvalidArgs`, zbus replies `UnknownProperty`.
+fn is_missing_property(err: &zbus::Error) -> bool {
+    matches!(
+        err,
+        zbus::Error::FDO(e) if matches!(
+            **e,
+            zbus::fdo::Error::UnknownProperty(_) | zbus::fdo::Error::InvalidArgs(_)
+        )
+    )
+}
+
+/// Menu paths used by clients to say they have no dbusmenu.
+fn is_no_menu_path(path: &str) -> bool {
+    path.is_empty() || path == "/" || path == "/NO_DBUSMENU"
+}
+
 #[derive(Debug, Clone)]
 pub enum TrayEvent {
     Registered(StatusNotifierItem),
@@ -102,9 +131,10 @@ pub enum TrayEvent {
 pub struct StatusNotifierItem {
     pub name: String,
     pub icon: Option<TrayIcon>,
-    pub menu: Layout,
+    /// `None` until the layout is known, or when the item has no menu.
+    pub menu: Option<Layout>,
     item_proxy: StatusNotifierItemProxy<'static>,
-    menu_proxy: DBusMenuProxy<'static>,
+    menu_proxy: Option<DBusMenuProxy<'static>>,
 }
 
 impl StatusNotifierItem {
@@ -119,16 +149,42 @@ impl StatusNotifierItem {
 
         debug!("item_proxy {item_proxy:?}");
 
+        // `Menu` is optional in the SNI spec. Any other error means the object
+        // is not there (yet), which the caller retries.
+        let menu_path = match item_proxy.menu().await {
+            Ok(path) if !is_no_menu_path(path.as_str()) => Some(path),
+            Ok(_) => None,
+            Err(err) if is_missing_property(&err) => None,
+            Err(err) => return Err(err.into()),
+        };
+
         let icon = current_icon_from_proxy(&item_proxy).await;
 
-        let menu_path = item_proxy.menu().await?;
-        let menu_proxy = dbus::DBusMenuProxy::builder(conn)
-            .destination(dest.to_owned())?
-            .path(menu_path.to_owned())?
-            .build()
-            .await?;
+        let menu_proxy = match menu_path {
+            Some(menu_path) => Some(
+                DBusMenuProxy::builder(conn)
+                    .destination(dest.to_owned())?
+                    .path(menu_path)?
+                    .build()
+                    .await?,
+            ),
+            None => {
+                debug!("tray item {name} has no menu");
+                None
+            }
+        };
 
-        let (_, menu) = menu_proxy.get_layout(0, -1, &[]).await?;
+        let menu = match &menu_proxy {
+            Some(menu_proxy) => match menu_proxy.get_layout(0, -1, &[]).await {
+                Ok((_, layout)) => Some(layout),
+                Err(err) => {
+                    // A later LayoutUpdated fills it in.
+                    debug!("tray item {name}: menu layout unavailable: {err}");
+                    None
+                }
+            },
+            None => None,
+        };
 
         Ok(Self {
             name,
@@ -137,6 +193,116 @@ impl StatusNotifierItem {
             item_proxy,
             menu_proxy,
         })
+    }
+
+    pub fn has_menu(&self) -> bool {
+        self.menu_proxy.is_some()
+    }
+
+    /// Change notifications for this item, merged into one stream.
+    async fn events(&self, conn: &zbus::Connection) -> BoxStream<'static, TrayEvent> {
+        let name = self.name.clone();
+        let mut streams: Vec<BoxStream<'static, TrayEvent>> = Vec::with_capacity(4);
+
+        streams.push(
+            self.item_proxy
+                .receive_icon_pixmap_changed()
+                .await
+                .filter_map({
+                    let name = name.clone();
+                    move |icon| {
+                        let name = name.clone();
+                        async move {
+                            let icons = icon.get().await.ok()?;
+                            pixmap_to_icon(icons).map(|icon| TrayEvent::IconChanged(name, icon))
+                        }
+                    }
+                })
+                .boxed(),
+        );
+
+        streams.push(
+            self.item_proxy
+                .receive_icon_name_changed()
+                .await
+                .filter_map({
+                    let name = name.clone();
+                    move |icon_name| {
+                        let name = name.clone();
+                        async move {
+                            icon_name
+                                .get()
+                                .await
+                                .ok()
+                                .as_deref()
+                                .and_then(xdg_icons::get_icon_from_name)
+                                .map(|icon| TrayEvent::IconChanged(name, icon))
+                        }
+                    }
+                })
+                .boxed(),
+        );
+
+        match self.new_icon_events(conn).await {
+            Ok(stream) => streams.push(stream),
+            Err(err) => debug!("tray item {name}: no NewIcon subscription: {err}"),
+        }
+
+        if let Some(menu_proxy) = &self.menu_proxy {
+            match menu_proxy.receive_layout_updated().await {
+                Ok(layout_updated) => streams.push(
+                    layout_updated
+                        .filter_map({
+                            let name = name.clone();
+                            let menu_proxy = menu_proxy.clone();
+                            move |_| {
+                                debug!("layout update event name {name}");
+
+                                let name = name.clone();
+                                let menu_proxy = menu_proxy.clone();
+                                async move {
+                                    menu_proxy.get_layout(0, -1, &[]).await.ok().map(
+                                        |(_, layout)| TrayEvent::MenuLayoutChanged(name, layout),
+                                    )
+                                }
+                            }
+                        })
+                        .boxed(),
+                ),
+                Err(err) => debug!("tray item {name}: no LayoutUpdated subscription: {err}"),
+            }
+        }
+
+        iced::futures::stream::select_all(streams).boxed()
+    }
+
+    async fn new_icon_events(
+        &self,
+        conn: &zbus::Connection,
+    ) -> anyhow::Result<BoxStream<'static, TrayEvent>> {
+        let new_icon = self.item_proxy.receive_new_icon().await?;
+        let (dest, path) = split_service_name(&self.name);
+        // NewIcon has no matching PropertiesChanged, so a cached read would be stale;
+        let uncached_proxy = StatusNotifierItemProxy::builder(conn)
+            .destination(dest.to_owned())?
+            .path(path.to_owned())?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await?;
+        let name = self.name.clone();
+
+        Ok(new_icon
+            .filter_map(move |_| {
+                let name = name.clone();
+                let uncached_proxy = uncached_proxy.clone();
+
+                async move {
+                    current_icon_from_proxy(&uncached_proxy)
+                        .await
+                        .map(|icon| TrayEvent::IconChanged(name, icon))
+                }
+            })
+            .boxed())
     }
 }
 
@@ -166,240 +332,198 @@ impl Deref for TrayService {
 
 enum State {
     Init,
-    Active(zbus::Connection),
+    Active {
+        conn: zbus::Connection,
+        failures: u32,
+    },
     Error,
 }
 
-impl TrayService {
-    async fn initialize_data(conn: &zbus::Connection) -> anyhow::Result<TrayData> {
-        debug!("initializing tray data");
-        let proxy = StatusNotifierWatcherProxy::new(conn).await?;
+/// Per-item subscriptions of the host, keyed by service name so they can be
+/// dropped when the item goes away.
+#[derive(Default)]
+struct ItemStreams {
+    events: SelectAll<BoxStream<'static, TrayEvent>>,
+    handles: HashMap<String, AbortHandle>,
+}
 
-        let items = proxy.registered_status_notifier_items().await?;
+impl ItemStreams {
+    async fn add(&mut self, conn: &zbus::Connection, item: &StatusNotifierItem) {
+        self.remove(&item.name);
 
-        let mut status_items = Vec::with_capacity(items.len());
-        for item in items {
-            let item = StatusNotifierItem::new(conn, item).await?;
-            status_items.push(item);
-        }
-
-        Ok(TrayData(status_items))
+        let (events, handle) = abortable(item.events(conn).await);
+        self.events.push(events.boxed());
+        self.handles.insert(item.name.clone(), handle);
     }
 
-    async fn events(
+    fn remove(&mut self, name: &str) {
+        if let Some(handle) = self.handles.remove(name) {
+            handle.abort();
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.handles.contains_key(name)
+    }
+}
+
+type RetryQueue = FuturesUnordered<BoxFuture<'static, (String, usize)>>;
+
+/// Queues another attempt for `name`. Returns `false` once the retries are
+/// used up.
+fn schedule_retry(retries: &mut RetryQueue, name: String, attempt: usize) -> bool {
+    let Some(&delay) = ITEM_RETRY_DELAYS.get(attempt) else {
+        return false;
+    };
+
+    retries.push(
+        async move {
+            tokio::time::sleep(delay).await;
+            (name, attempt + 1)
+        }
+        .boxed(),
+    );
+
+    true
+}
+
+impl TrayService {
+    /// Loads an item and subscribes to its changes, or queues a retry.
+    async fn load_item(
         conn: &zbus::Connection,
-    ) -> anyhow::Result<impl Stream<Item = TrayEvent> + use<>> {
-        let watcher = StatusNotifierWatcherProxy::new(conn).await?;
-
-        let registered = watcher
-            .receive_status_notifier_item_registered()
-            .await?
-            .filter_map({
-                let conn = conn.clone();
-                move |e| {
-                    let conn = conn.clone();
-                    async move {
-                        debug!("registered {e:?}");
-                        match e.args() {
-                            Ok(args) => {
-                                let item =
-                                    StatusNotifierItem::new(&conn, args.service.to_string()).await;
-
-                                item.map(TrayEvent::Registered).ok()
-                            }
-                            _ => None,
-                        }
-                    }
-                }
-            })
-            .boxed();
-        let unregistered = watcher
-            .receive_status_notifier_item_unregistered()
-            .await?
-            .filter_map(|e| async move {
-                debug!("unregistered {e:?}");
-
-                match e.args() {
-                    Ok(args) => Some(TrayEvent::Unregistered(args.service.to_string())),
-                    _ => None,
-                }
-            })
-            .boxed();
-
-        let items = watcher.registered_status_notifier_items().await?;
-        let mut icon_pixel_change = Vec::with_capacity(items.len());
-        let mut icon_name_change = Vec::with_capacity(items.len());
-        let mut new_icon_change = Vec::with_capacity(items.len());
-        let mut menu_layout_change = Vec::with_capacity(items.len());
-
-        for name in items {
-            let item = StatusNotifierItem::new(conn, name.to_string()).await?;
-
-            icon_pixel_change.push(
-                item.item_proxy
-                    .receive_icon_pixmap_changed()
-                    .await
-                    .filter_map({
-                        let name = name.clone();
-                        move |icon| {
-                            let name = name.clone();
-                            async move {
-                                let icons = icon.get().await.ok()?;
-                                pixmap_to_icon(icons)
-                                    .map(|icon| TrayEvent::IconChanged(name.to_owned(), icon))
-                            }
-                        }
-                    })
-                    .boxed(),
-            );
-
-            icon_name_change.push(
-                item.item_proxy
-                    .receive_icon_name_changed()
-                    .await
-                    .filter_map({
-                        let name = name.clone();
-                        move |icon_name| {
-                            let name = name.clone();
-                            async move {
-                                icon_name
-                                    .get()
-                                    .await
-                                    .ok()
-                                    .as_deref()
-                                    .and_then(xdg_icons::get_icon_from_name)
-                                    .map(|icon| TrayEvent::IconChanged(name.to_owned(), icon))
-                            }
-                        }
-                    })
-                    .boxed(),
-            );
-
-            let new_icon = item.item_proxy.receive_new_icon().await;
-            if let Ok(new_icon) = new_icon {
-                let (dest, path) = split_service_name(&name);
-                // NewIcon has no matching PropertiesChanged, so a cached read would be stale;
-                let uncached_proxy = StatusNotifierItemProxy::builder(conn)
-                    .destination(dest.to_owned())?
-                    .path(path.to_owned())?
-                    .cache_properties(zbus::proxy::CacheProperties::No)
-                    .build()
-                    .await?;
-
-                new_icon_change.push(
-                    new_icon
-                        .filter_map({
-                            let name = name.clone();
-                            let uncached_proxy = uncached_proxy;
-
-                            move |_| {
-                                let name = name.clone();
-                                let uncached_proxy = uncached_proxy.clone();
-
-                                async move {
-                                    current_icon_from_proxy(&uncached_proxy)
-                                        .await
-                                        .map(|icon| TrayEvent::IconChanged(name.to_owned(), icon))
-                                }
-                            }
-                        })
-                        .boxed(),
-                );
+        name: String,
+        attempt: usize,
+        streams: &mut ItemStreams,
+        retries: &mut RetryQueue,
+    ) -> Option<StatusNotifierItem> {
+        match StatusNotifierItem::new(conn, name.clone()).await {
+            Ok(item) => {
+                streams.add(conn, &item).await;
+                Some(item)
             }
+            Err(err) => {
+                if schedule_retry(retries, name.clone(), attempt) {
+                    debug!("tray item {name} not ready (attempt {attempt}): {err}");
+                } else {
+                    warn!("Giving up on tray item {name}: {err}");
+                }
+                None
+            }
+        }
+    }
 
-            let layout_updated = item.menu_proxy.receive_layout_updated().await;
-            if let Ok(layout_updated) = layout_updated {
-                menu_layout_change.push(
-                    layout_updated
-                        .filter_map({
-                            let name = name.clone();
-                            let menu_proxy = item.menu_proxy.clone();
-                            move |_| {
-                                debug!("layout update event name {}", name);
+    /// Runs the host side: reads the watcher's items, sends `Init`, then
+    /// forwards changes until a signal stream ends or setup fails.
+    async fn run_host(
+        conn: &zbus::Connection,
+        output: &mut Sender<ServiceEvent<Self>>,
+        failures: &mut u32,
+    ) -> anyhow::Result<()> {
+        // Our watcher never emits PropertiesChanged for RegisteredStatusNotifierItems,
+        // so a cached read would return the list from proxy creation.
+        let watcher = StatusNotifierWatcherProxy::builder(conn)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await?;
 
-                                let name = name.clone();
-                                let menu_proxy = menu_proxy.clone();
-                                async move {
-                                    menu_proxy.get_layout(0, -1, &[]).await.ok().map(
-                                        |(_, layout)| {
-                                            TrayEvent::MenuLayoutChanged(name.to_owned(), layout)
-                                        },
-                                    )
-                                }
-                            }
-                        })
-                        .boxed(),
-                );
+        // Subscribe before reading the list: an item registering in between is
+        // then seen by at least one of the two, and duplicates are skipped.
+        let mut registered = watcher.receive_status_notifier_item_registered().await?;
+        let mut unregistered = watcher.receive_status_notifier_item_unregistered().await?;
+        let names = watcher.registered_status_notifier_items().await?;
+
+        let mut streams = ItemStreams::default();
+        let mut retries = RetryQueue::new();
+        let mut items = Vec::with_capacity(names.len());
+
+        for name in names {
+            if streams.contains(&name) {
+                continue;
+            }
+            if let Some(item) = Self::load_item(conn, name, 0, &mut streams, &mut retries).await {
+                items.push(item);
             }
         }
 
-        Ok(stream_select!(
-            registered,
-            unregistered,
-            select_all(icon_pixel_change),
-            select_all(icon_name_change),
-            select_all(new_icon_change),
-            select_all(menu_layout_change)
-        )
-        .boxed())
+        info!("Tray service initialized with {} items", items.len());
+
+        let _ = output
+            .send(ServiceEvent::Init(TrayService {
+                data: TrayData(items),
+                _conn: conn.clone(),
+            }))
+            .await;
+        *failures = 0;
+
+        info!("Listening for tray events");
+
+        loop {
+            let event = tokio::select! {
+                Some(signal) = registered.next() => {
+                    let Ok(args) = signal.args() else {
+                        continue;
+                    };
+                    let name = args.service.to_string();
+                    debug!("registered {name}");
+
+                    if streams.contains(&name) {
+                        continue;
+                    }
+                    Self::load_item(conn, name, 0, &mut streams, &mut retries)
+                        .await
+                        .map(TrayEvent::Registered)
+                }
+                Some((name, attempt)) = retries.next() => {
+                    if streams.contains(&name) {
+                        continue;
+                    }
+                    Self::load_item(conn, name, attempt, &mut streams, &mut retries)
+                        .await
+                        .map(TrayEvent::Registered)
+                }
+                Some(signal) = unregistered.next() => {
+                    let Ok(args) = signal.args() else {
+                        continue;
+                    };
+                    let name = args.service.to_string();
+                    debug!("unregistered {name}");
+
+                    streams.remove(&name);
+                    Some(TrayEvent::Unregistered(name))
+                }
+                Some(event) = streams.events.next() => Some(event),
+                else => break,
+            };
+
+            if let Some(event) = event {
+                debug!("tray data {event:?}");
+                let _ = output.send(ServiceEvent::Update(event)).await;
+            }
+        }
+
+        Err(anyhow::anyhow!("watcher signal streams ended"))
     }
 
     async fn start_listening(state: State, output: &mut Sender<ServiceEvent<Self>>) -> State {
         match state {
             State::Init => match StatusNotifierWatcher::start_server().await {
-                Ok(conn) => {
-                    let data = TrayService::initialize_data(&conn).await;
-
-                    match data {
-                        Ok(data) => {
-                            info!("Tray service initialized");
-
-                            let _ = output
-                                .send(ServiceEvent::Init(TrayService {
-                                    data,
-                                    _conn: conn.clone(),
-                                }))
-                                .await;
-
-                            State::Active(conn)
-                        }
-                        Err(err) => {
-                            error!("Failed to initialize tray service: {err}");
-
-                            State::Error
-                        }
-                    }
-                }
+                Ok(conn) => State::Active { conn, failures: 0 },
                 Err(err) => {
                     error!("Failed to connect to system bus: {err}");
 
                     State::Error
                 }
             },
-            State::Active(conn) => {
-                info!("Listening for tray events");
+            State::Active { conn, mut failures } => {
+                if let Err(err) = TrayService::run_host(&conn, output, &mut failures).await {
+                    let backoff = Duration::from_secs(1 << failures.min(5)).min(MAX_HOST_BACKOFF);
+                    error!("Tray host failed: {err}, retrying in {backoff:?}");
 
-                match TrayService::events(&conn).await {
-                    Ok(mut events) => {
-                        while let Some(event) = events.next().await {
-                            debug!("tray data {event:?}");
-
-                            let reload_events = matches!(event, TrayEvent::Registered(_));
-
-                            let _ = output.send(ServiceEvent::Update(event)).await;
-
-                            if reload_events {
-                                break;
-                            }
-                        }
-
-                        State::Active(conn)
-                    }
-                    Err(err) => {
-                        error!("Failed to listen for tray events: {err}");
-                        State::Error
-                    }
+                    tokio::time::sleep(backoff).await;
+                    failures += 1;
                 }
+
+                State::Active { conn, failures }
             }
             State::Error => {
                 error!("Tray service error");
@@ -459,7 +583,7 @@ impl ReadOnlyService for TrayService {
             TrayEvent::MenuLayoutChanged(name, layout) => {
                 if let Some(item) = self.data.0.iter_mut().find(|item| item.name == name) {
                     debug!("menu layout updated, {layout:?}");
-                    item.menu = layout;
+                    item.menu = Some(layout);
                 }
             }
             TrayEvent::Unregistered(name) => {
@@ -494,17 +618,17 @@ impl Service for TrayService {
     fn command(&mut self, command: Self::Command) -> Task<ServiceEvent<Self>> {
         match command {
             TrayCommand::MenuSelected(name, id) => {
-                let menu = self.data.iter().find(|item| item.name == name);
-                if let Some(menu) = menu {
+                let menu_proxy = self
+                    .data
+                    .iter()
+                    .find(|item| item.name == name)
+                    .and_then(|item| item.menu_proxy.clone());
+                if let Some(proxy) = menu_proxy {
                     let name_cb = name.clone();
                     Task::perform(
-                        {
-                            let proxy = menu.menu_proxy.clone();
-
-                            async move {
-                                debug!("Click tray menu voice {name} : {id}");
-                                TrayService::menu_voice_selected(&proxy, id).await
-                            }
+                        async move {
+                            debug!("Click tray menu voice {name} : {id}");
+                            TrayService::menu_voice_selected(&proxy, id).await
                         },
                         move |new_layout| match new_layout {
                             Ok(new_layout) => ServiceEvent::Update(TrayEvent::MenuLayoutChanged(

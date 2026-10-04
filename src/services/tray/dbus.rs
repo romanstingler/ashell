@@ -16,9 +16,29 @@ const NAME: WellKnownName =
     WellKnownName::from_static_str_unchecked("org.kde.StatusNotifierWatcher");
 const OBJECT_PATH: &str = "/StatusNotifierWatcher";
 
+#[derive(Debug)]
+struct RegisteredItem {
+    /// Unique name of the connection that owns the item.
+    sender: UniqueName<'static>,
+    /// Object path of the item on that connection.
+    path: String,
+    /// Value advertised in `RegisteredStatusNotifierItems`.
+    service: String,
+}
+
 #[derive(Debug, Default)]
 pub struct StatusNotifierWatcher {
-    items: Vec<(UniqueName<'static>, String)>,
+    items: Vec<RegisteredItem>,
+}
+
+/// Object path an item registration refers to. `service` is either an
+/// object path (the sender is the bus name), a bus name with the default
+/// path, or `bus_name/path`.
+fn registration_path(service: &str) -> &str {
+    match service.find('/') {
+        Some(idx) => &service[idx..],
+        None => "/StatusNotifierItem",
+    }
 }
 
 impl StatusNotifierWatcher {
@@ -66,24 +86,28 @@ impl StatusNotifierWatcher {
                                 info!("Lost bus name: {NAME}");
                                 have_bus_name = false;
                             }
-                        } else if let BusName::Unique(name) = &args.name {
+                        } else if let BusName::Unique(name) = &args.name
+                            && args.new_owner.is_none()
+                        {
                             let mut interface = internal_interface.get_mut().await;
-                            if let Some(idx) = interface
-                                .items
-                                .iter()
-                                .position(|(unique_name, _)| unique_name == name)
-                            {
-                                let emitter = match
-                                    SignalEmitter::new(&internal_connection, OBJECT_PATH) {
+                            let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut interface.items)
+                                .into_iter()
+                                .partition(|item| &item.sender == name);
+                            interface.items = kept;
+
+                            if gone.is_empty() {
+                                continue;
+                            }
+                            let emitter = match SignalEmitter::new(&internal_connection, OBJECT_PATH) {
                                 Ok(e) => e,
                                 Err(e) => {
                                     warn!("Failed to create signal emitter: {e}");
                                     continue;
                                 }
                             };
-                                let service = interface.items.remove(idx).1;
+                            for item in gone {
                                 if let Err(e) = StatusNotifierWatcher::status_notifier_item_unregistered(
-                                    &emitter, &service,
+                                    &emitter, &item.service,
                                 )
                                 .await {
                                     warn!("Failed to emit item_unregistered signal: {e}");
@@ -158,7 +182,15 @@ impl StatusNotifierWatcher {
         sender: UniqueName<'static>,
         emitter: &SignalEmitter<'_>,
     ) {
-        if self.items.iter().any(|(s, _)| s == &sender) {
+        // One connection can export several items, so the sender alone is not
+        // a key; the same item can also arrive both by method call and by
+        // discovery under different spellings.
+        let path = registration_path(service).to_owned();
+        if self
+            .items
+            .iter()
+            .any(|item| item.sender == sender && item.path == path)
+        {
             return;
         }
 
@@ -172,7 +204,11 @@ impl StatusNotifierWatcher {
             .await
             .unwrap_or_else(|e| warn!("Failed to emit item_registered signal: {e}"));
 
-        self.items.push((sender, service));
+        self.items.push(RegisteredItem {
+            sender,
+            path,
+            service,
+        });
     }
 }
 
@@ -212,7 +248,7 @@ impl StatusNotifierWatcher {
 
     #[zbus(property)]
     fn registered_status_notifier_items(&self) -> Vec<String> {
-        self.items.iter().map(|(_, x)| x.clone()).collect()
+        self.items.iter().map(|item| item.service.clone()).collect()
     }
 
     #[zbus(property)]
