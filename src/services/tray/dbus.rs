@@ -280,7 +280,7 @@ impl StatusNotifierWatcher {
     async fn status_notifier_host_unregistered(emitter: &SignalEmitter<'_>) -> Result<()>;
 }
 
-#[derive(Clone, Debug, zvariant::Value)]
+#[derive(Clone, Debug, PartialEq, Eq, zvariant::Value)]
 pub struct Icon {
     pub width: i32,
     pub height: i32,
@@ -296,10 +296,16 @@ pub trait StatusNotifierItem {
     fn icon_pixmap(&self) -> zbus::Result<Vec<Icon>>;
 
     #[zbus(property)]
+    fn icon_theme_path(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
     fn menu(&self) -> zbus::Result<OwnedObjectPath>;
 
     #[zbus(signal)]
     fn new_icon(&self) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn new_icon_theme_path(&self, icon_theme_path: &str) -> zbus::Result<()>;
 
     fn activate(&self, x: i32, y: i32) -> zbus::Result<()>;
 }

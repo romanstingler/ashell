@@ -10,13 +10,14 @@ use iced::{
         FutureExt, SinkExt, StreamExt,
         channel::mpsc::Sender,
         future::BoxFuture,
-        stream::{AbortHandle, BoxStream, FuturesUnordered, SelectAll, abortable, pending},
+        future::ready,
+        stream::{self, AbortHandle, BoxStream, FuturesUnordered, SelectAll, abortable, pending},
     },
     stream::channel,
     widget::image,
 };
 use log::{debug, error, info, trace, warn};
-use std::{any::TypeId, collections::HashMap, ops::Deref, time::Duration};
+use std::{any::TypeId, collections::HashMap, ops::Deref, path::Path, time::Duration};
 
 pub mod dbus;
 
@@ -33,9 +34,9 @@ const ITEM_RETRY_DELAYS: [Duration; 3] = [
 /// Upper bound for the backoff between host restarts after a failure.
 const MAX_HOST_BACKOFF: Duration = Duration::from_secs(30);
 
-fn pixmap_to_icon(icons: Vec<dbus::Icon>) -> Option<TrayIcon> {
+fn pixmap_to_icon(icons: &[dbus::Icon]) -> Option<TrayIcon> {
     icons
-        .into_iter()
+        .iter()
         .filter(|i| {
             // SNI clients sometimes return entries with zero dimensions or a
             // bytes payload that doesn't match width*height*4 (e.g. when only
@@ -69,29 +70,115 @@ fn pixmap_to_icon(icons: Vec<dbus::Icon>) -> Option<TrayIcon> {
             trace!("tray icon w {}, h {}", i.width, i.height);
             (i.width, i.height)
         })
-        .map(|mut i| {
+        .map(|i| {
             // Convert ARGB to RGBA
-            for pixel in i.bytes.as_chunks_mut::<4>().0 {
+            let mut bytes = i.bytes.clone();
+            for pixel in bytes.as_chunks_mut::<4>().0 {
                 pixel.rotate_left(1);
             }
             TrayIcon::Image(image::Handle::from_rgba(
                 i.width as u32,
                 i.height as u32,
-                i.bytes,
+                bytes,
             ))
         })
 }
 
-async fn current_icon_from_proxy(item_proxy: &StatusNotifierItemProxy<'_>) -> Option<TrayIcon> {
-    match item_proxy.icon_pixmap().await.ok().and_then(pixmap_to_icon) {
-        Some(icon) => Some(icon),
-        None => item_proxy
-            .icon_name()
-            .await
-            .ok()
-            .as_deref()
-            .and_then(xdg_icons::get_icon_from_name),
+/// The icon properties of an item, read together so one refresh resolves
+/// one consistent state.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct IconSource {
+    name: String,
+    theme_path: String,
+    pixmap: Vec<dbus::Icon>,
+}
+
+impl std::fmt::Debug for IconSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IconSource")
+            .field("name", &self.name)
+            .field("theme_path", &self.theme_path)
+            .field(
+                "pixmap",
+                &self
+                    .pixmap
+                    .iter()
+                    .map(|i| (i.width, i.height))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
     }
+}
+
+impl IconSource {
+    /// `None` when neither `IconName` nor `IconPixmap` could be read, e.g.
+    /// because the item is going away.
+    async fn read(proxy: &StatusNotifierItemProxy<'_>) -> Option<Self> {
+        let (name, pixmap, theme_path) = iced::futures::join!(
+            proxy.icon_name(),
+            proxy.icon_pixmap(),
+            proxy.icon_theme_path()
+        );
+        if name.is_err() && pixmap.is_err() {
+            return None;
+        }
+
+        Some(Self {
+            name: name.unwrap_or_default(),
+            theme_path: theme_path.unwrap_or_default(),
+            pixmap: pixmap.unwrap_or_default(),
+        })
+    }
+
+    /// Named icons win over pixmaps, as the SNI spec asks and as Waybar and
+    /// noctalia do. Fuzzy name matching runs last so it cannot replace a
+    /// correct pixmap with an unrelated icon.
+    fn resolve(&self) -> Option<TrayIcon> {
+        let name = self.name.as_str();
+
+        if name.starts_with('/') {
+            if let Some(icon) = xdg_icons::get_icon_from_file(Path::new(name)) {
+                return Some(icon);
+            }
+        } else if !name.is_empty() {
+            if !self.theme_path.is_empty()
+                && let Some(icon) =
+                    xdg_icons::get_icon_from_theme_path(Path::new(&self.theme_path), name)
+            {
+                return Some(icon);
+            }
+            if let Some(icon) = xdg_icons::get_exact_icon_from_name(name) {
+                return Some(icon);
+            }
+        }
+
+        if let Some(icon) = pixmap_to_icon(&self.pixmap) {
+            return Some(icon);
+        }
+
+        if !name.starts_with('/') {
+            let icon = xdg_icons::get_icon_from_name(name);
+            if icon.is_none() {
+                debug!("tray icon {self:?} did not resolve");
+            }
+            return icon;
+        }
+
+        debug!("tray icon {self:?} did not resolve");
+        None
+    }
+}
+
+/// Coalesces bursts of icon notifications, like Plasma and Waybar do.
+const ICON_REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
+
+const ICON_PROPERTIES: [&str; 3] = ["IconName", "IconPixmap", "IconThemePath"];
+
+struct IconRefresh {
+    triggers: SelectAll<BoxStream<'static, ()>>,
+    proxy: StatusNotifierItemProxy<'static>,
+    last: IconSource,
+    check_now: bool,
 }
 
 fn split_service_name(name: &str) -> (&str, &str) {
@@ -121,7 +208,8 @@ fn is_no_menu_path(path: &str) -> bool {
 #[derive(Debug, Clone)]
 pub enum TrayEvent {
     Registered(StatusNotifierItem),
-    IconChanged(String, TrayIcon),
+    /// `None` when nothing resolves; the module shows a placeholder.
+    IconChanged(String, Option<TrayIcon>),
     MenuLayoutChanged(String, Layout),
     Unregistered(String),
     None,
@@ -133,6 +221,7 @@ pub struct StatusNotifierItem {
     pub icon: Option<TrayIcon>,
     /// `None` until the layout is known, or when the item has no menu.
     pub menu: Option<Layout>,
+    icon_source: IconSource,
     item_proxy: StatusNotifierItemProxy<'static>,
     menu_proxy: Option<DBusMenuProxy<'static>>,
 }
@@ -158,7 +247,8 @@ impl StatusNotifierItem {
             Err(err) => return Err(err.into()),
         };
 
-        let icon = current_icon_from_proxy(&item_proxy).await;
+        let icon_source = IconSource::read(&item_proxy).await.unwrap_or_default();
+        let icon = icon_source.resolve();
 
         let menu_proxy = match menu_path {
             Some(menu_path) => Some(
@@ -190,6 +280,7 @@ impl StatusNotifierItem {
             name,
             icon,
             menu,
+            icon_source,
             item_proxy,
             menu_proxy,
         })
@@ -202,50 +293,11 @@ impl StatusNotifierItem {
     /// Change notifications for this item, merged into one stream.
     async fn events(&self, conn: &zbus::Connection) -> BoxStream<'static, TrayEvent> {
         let name = self.name.clone();
-        let mut streams: Vec<BoxStream<'static, TrayEvent>> = Vec::with_capacity(4);
+        let mut streams: Vec<BoxStream<'static, TrayEvent>> = Vec::with_capacity(2);
 
-        streams.push(
-            self.item_proxy
-                .receive_icon_pixmap_changed()
-                .await
-                .filter_map({
-                    let name = name.clone();
-                    move |icon| {
-                        let name = name.clone();
-                        async move {
-                            let icons = icon.get().await.ok()?;
-                            pixmap_to_icon(icons).map(|icon| TrayEvent::IconChanged(name, icon))
-                        }
-                    }
-                })
-                .boxed(),
-        );
-
-        streams.push(
-            self.item_proxy
-                .receive_icon_name_changed()
-                .await
-                .filter_map({
-                    let name = name.clone();
-                    move |icon_name| {
-                        let name = name.clone();
-                        async move {
-                            icon_name
-                                .get()
-                                .await
-                                .ok()
-                                .as_deref()
-                                .and_then(xdg_icons::get_icon_from_name)
-                                .map(|icon| TrayEvent::IconChanged(name, icon))
-                        }
-                    }
-                })
-                .boxed(),
-        );
-
-        match self.new_icon_events(conn).await {
+        match self.icon_events(conn).await {
             Ok(stream) => streams.push(stream),
-            Err(err) => debug!("tray item {name}: no NewIcon subscription: {err}"),
+            Err(err) => debug!("tray item {name}: no icon subscription: {err}"),
         }
 
         if let Some(menu_proxy) = &self.menu_proxy {
@@ -276,33 +328,95 @@ impl StatusNotifierItem {
         iced::futures::stream::select_all(streams).boxed()
     }
 
-    async fn new_icon_events(
+    /// One `IconChanged` per change of the icon properties, whichever way
+    /// the client announces it: `NewIcon`, `NewIconThemePath` or
+    /// `PropertiesChanged`.
+    async fn icon_events(
         &self,
         conn: &zbus::Connection,
     ) -> anyhow::Result<BoxStream<'static, TrayEvent>> {
-        let new_icon = self.item_proxy.receive_new_icon().await?;
         let (dest, path) = split_service_name(&self.name);
-        // NewIcon has no matching PropertiesChanged, so a cached read would be stale;
-        let uncached_proxy = StatusNotifierItemProxy::builder(conn)
+        // NewIcon has no matching PropertiesChanged, so a cached read would be stale.
+        let proxy = StatusNotifierItemProxy::builder(conn)
             .destination(dest.to_owned())?
             .path(path.to_owned())?
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
             .await?;
+        let properties = zbus::fdo::PropertiesProxy::builder(conn)
+            .destination(dest.to_owned())?
+            .path(path.to_owned())?
+            .build()
+            .await?;
+
+        let mut triggers = SelectAll::new();
+        triggers.push(
+            self.item_proxy
+                .receive_new_icon()
+                .await?
+                .map(|_| ())
+                .boxed(),
+        );
+        triggers.push(
+            self.item_proxy
+                .receive_new_icon_theme_path()
+                .await?
+                .map(|_| ())
+                .boxed(),
+        );
+        triggers.push(
+            properties
+                .receive_properties_changed()
+                .await?
+                .filter(|signal| {
+                    ready(signal.args().is_ok_and(|args| {
+                        args.interface_name == "org.kde.StatusNotifierItem"
+                            && args
+                                .changed_properties
+                                .keys()
+                                .chain(args.invalidated_properties.iter())
+                                .any(|prop| ICON_PROPERTIES.contains(prop))
+                    }))
+                })
+                .map(|_| ())
+                .boxed(),
+        );
+
+        // Subscribed first, then compared with what `new` resolved, so a change
+        // in between is not lost.
+        let state = IconRefresh {
+            triggers,
+            proxy,
+            last: self.icon_source.clone(),
+            check_now: true,
+        };
         let name = self.name.clone();
 
-        Ok(new_icon
-            .filter_map(move |_| {
-                let name = name.clone();
-                let uncached_proxy = uncached_proxy.clone();
+        Ok(stream::unfold(state, move |mut state| {
+            let name = name.clone();
+            async move {
+                loop {
+                    if !std::mem::take(&mut state.check_now) {
+                        state.triggers.next().await?;
+                        tokio::time::sleep(ICON_REFRESH_DEBOUNCE).await;
+                        while let Some(Some(())) = state.triggers.next().now_or_never() {}
+                    }
 
-                async move {
-                    current_icon_from_proxy(&uncached_proxy)
-                        .await
-                        .map(|icon| TrayEvent::IconChanged(name, icon))
+                    let Some(source) = IconSource::read(&state.proxy).await else {
+                        continue;
+                    };
+                    if source == state.last {
+                        continue;
+                    }
+
+                    debug!("tray item {name}: icon source {source:?}");
+                    let icon = source.resolve();
+                    state.last = source;
+                    return Some((TrayEvent::IconChanged(name, icon), state));
                 }
-            })
-            .boxed())
+            }
+        })
+        .boxed())
     }
 }
 
@@ -575,9 +689,9 @@ impl ReadOnlyService for TrayService {
                     }
                 }
             }
-            TrayEvent::IconChanged(name, handle) => {
+            TrayEvent::IconChanged(name, icon) => {
                 if let Some(item) = self.data.0.iter_mut().find(|item| item.name == name) {
-                    item.icon = Some(handle);
+                    item.icon = icon;
                 }
             }
             TrayEvent::MenuLayoutChanged(name, layout) => {

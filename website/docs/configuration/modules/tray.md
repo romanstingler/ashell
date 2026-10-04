@@ -23,6 +23,19 @@ You can configure what happens when right-clicking a tray icon using `right_clic
 
 Applications without a menu are activated by any click.
 
+## Icons
+
+Each icon is chosen from what the application publishes, in this order:
+
+1. the icon file, when the application gives an absolute path as its icon name
+2. the icon name, looked up in the application's own icon directory (`IconThemePath`)
+3. the icon name, looked up in your icon theme
+4. the image data sent by the application
+5. a similar icon name from your icon theme or installed applications
+
+If nothing matches, a small dot is shown. Named icons come first so that the
+icon follows your theme, as with other status bars.
+
 ## Examples
 
 **Hide multiple applications by pattern:**

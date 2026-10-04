@@ -9,13 +9,17 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::LazyLock,
 };
 
 use std::sync::RwLock;
 
 const MAX_SIMILAR_ICON_CANDIDATES: usize = 5;
+/// Bounds for walking an SNI `IconThemePath`, which the client controls.
+const THEME_PATH_MAX_DEPTH: usize = 4;
+const THEME_PATH_MAX_ENTRIES: usize = 2000;
+const ICON_FILE_EXTENSIONS: [&str; 2] = ["svg", "png"];
 
 struct IconEntry {
     name: Box<str>,
@@ -114,6 +118,111 @@ pub fn get_icon_from_name(icon_name: &str) -> Option<XdgIcon> {
     let result = lookup_icon(icon_name);
     cache.insert(icon_name.to_string(), result.clone());
     result
+}
+
+/// Theme lookup without the fuzzy fallbacks of [`get_icon_from_name`].
+pub fn get_exact_icon_from_name(icon_name: &str) -> Option<XdgIcon> {
+    if !is_safe_icon_name(icon_name) {
+        return None;
+    }
+
+    find_icon_path(icon_name).and_then(icon_from_path)
+}
+
+fn has_icon_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ICON_FILE_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+}
+
+fn is_plain_absolute(path: &Path) -> bool {
+    path.is_absolute() && !path.components().any(|c| c == Component::ParentDir)
+}
+
+/// Icon from an absolute file path, which some SNI clients put in `IconName`.
+pub fn get_icon_from_file(path: &Path) -> Option<XdgIcon> {
+    if !is_plain_absolute(path) || !has_icon_extension(path) || !path.is_file() {
+        debug!("icon file {path:?}: rejected or missing");
+        return None;
+    }
+
+    icon_from_path(path.to_path_buf())
+}
+
+/// Pixel size encoded in an icon theme directory name (`22x22`, `48x48@2`).
+fn icon_dir_size(dir: &str) -> Option<u32> {
+    let (width, rest) = dir.split_once('x')?;
+    let height = rest.split('@').next()?;
+    (width == height).then(|| width.parse().ok()).flatten()
+}
+
+/// Looks `icon_name` up below an SNI `IconThemePath`, either a flat
+/// directory or a theme tree (`hicolor/22x22/apps/...`). SVG wins, then the
+/// largest PNG.
+pub fn get_icon_from_theme_path(theme_path: &Path, icon_name: &str) -> Option<XdgIcon> {
+    if !is_plain_absolute(theme_path) || !is_safe_icon_name(icon_name) {
+        return None;
+    }
+
+    let mut best: Option<(u32, PathBuf)> = None;
+    let mut budget = THEME_PATH_MAX_ENTRIES;
+    let mut dirs = vec![(theme_path.to_path_buf(), 0)];
+
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            if budget == 0 {
+                debug!("icon theme path {theme_path:?}: entry budget exhausted");
+                break;
+            }
+            budget -= 1;
+
+            let path = entry.path();
+            // Symlinked directories are not followed, to keep the walk bounded.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if depth < THEME_PATH_MAX_DEPTH {
+                    dirs.push((path, depth + 1));
+                }
+                continue;
+            }
+
+            if path.file_stem().and_then(|s| s.to_str()) != Some(icon_name)
+                || !has_icon_extension(&path)
+                || !path.is_file()
+            {
+                continue;
+            }
+
+            let rank = if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
+            {
+                u32::MAX
+            } else {
+                path.strip_prefix(theme_path)
+                    .ok()
+                    .and_then(|rel| {
+                        rel.components()
+                            .filter_map(|c| c.as_os_str().to_str().and_then(icon_dir_size))
+                            .max()
+                    })
+                    .unwrap_or(0)
+            };
+
+            if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+                best = Some((rank, path));
+            }
+        }
+    }
+
+    best.and_then(|(_, path)| icon_from_path(path))
 }
 
 fn lookup_icon(icon_name: &str) -> Option<XdgIcon> {
@@ -444,7 +553,11 @@ fn icon_directories() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_icon_from_name, is_safe_icon_name};
+    use super::{
+        XdgIcon, get_icon_from_file, get_icon_from_name, get_icon_from_theme_path, icon_dir_size,
+        is_safe_icon_name,
+    };
+    use std::{fs, path::Path};
 
     #[test]
     fn accepts_ordinary_icon_names() {
@@ -487,5 +600,51 @@ mod tests {
         assert!(get_icon_from_name("../../etc/passwd").is_none());
         assert!(get_icon_from_name("/etc/passwd").is_none());
         assert!(get_icon_from_name("").is_none());
+    }
+
+    #[test]
+    fn parses_icon_dir_sizes() {
+        assert_eq!(icon_dir_size("22x22"), Some(22));
+        assert_eq!(icon_dir_size("48x48@2"), Some(48));
+        assert_eq!(icon_dir_size("scalable"), None);
+        assert_eq!(icon_dir_size("16x24"), None);
+        assert_eq!(icon_dir_size("apps"), None);
+    }
+
+    #[test]
+    fn icon_file_requires_plain_absolute_icon_path() {
+        assert!(get_icon_from_file(Path::new("relative/icon.png")).is_none());
+        assert!(get_icon_from_file(Path::new("/tmp/../etc/passwd")).is_none());
+        assert!(get_icon_from_file(Path::new("/etc/passwd")).is_none());
+    }
+
+    #[test]
+    fn theme_path_prefers_svg_then_largest_png() {
+        let root = std::env::temp_dir().join(format!("ashell-theme-path-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in ["hicolor/16x16/apps", "hicolor/48x48/apps", "flat"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("hicolor/16x16/apps/tray.png"), b"").unwrap();
+        fs::write(root.join("hicolor/48x48/apps/tray.png"), b"").unwrap();
+
+        match get_icon_from_theme_path(&root, "tray") {
+            Some(XdgIcon::Image(iced::widget::image::Handle::Path(_, path))) => {
+                assert!(path.ends_with("48x48/apps/tray.png"), "picked {path:?}");
+            }
+            other => panic!("expected the 48px PNG, got {other:?}"),
+        }
+
+        fs::write(root.join("flat/tray.svg"), b"").unwrap();
+        assert!(matches!(
+            get_icon_from_theme_path(&root, "tray"),
+            Some(XdgIcon::Svg(_))
+        ));
+
+        assert!(get_icon_from_theme_path(&root, "missing").is_none());
+        assert!(get_icon_from_theme_path(&root, "../tray").is_none());
+        assert!(get_icon_from_theme_path(Path::new("relative"), "tray").is_none());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }
