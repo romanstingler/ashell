@@ -18,6 +18,7 @@ use iced::{
 };
 use log::{debug, error, info, trace, warn};
 use std::{any::TypeId, collections::HashMap, ops::Deref, path::Path, time::Duration};
+use zbus::fdo::RequestNameFlags;
 
 pub mod dbus;
 
@@ -448,6 +449,8 @@ enum State {
     Init,
     Active {
         conn: zbus::Connection,
+        /// Our `org.kde.StatusNotifierHost-<pid>` name, if we got it.
+        host: Option<String>,
         failures: u32,
     },
     Error,
@@ -527,9 +530,12 @@ impl TrayService {
     }
 
     /// Runs the host side: reads the watcher's items, sends `Init`, then
-    /// forwards changes until a signal stream ends or setup fails.
+    /// forwards changes. Returns `Ok` when the watcher changes owner, so the
+    /// caller starts over against the new one, and `Err` when setup fails or a
+    /// signal stream ends.
     async fn run_host(
         conn: &zbus::Connection,
+        host: Option<&str>,
         output: &mut Sender<ServiceEvent<Self>>,
         failures: &mut u32,
     ) -> anyhow::Result<()> {
@@ -539,6 +545,17 @@ impl TrayService {
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
             .await?;
+
+        // The watcher may be ours or another process's, and can change hands
+        // (it exits, or another bar replaces it). Subscribed first so a change
+        // during setup is not missed.
+        let mut owner_changed = watcher.inner().receive_owner_changed().await?;
+
+        if let Some(host) = host
+            && let Err(err) = watcher.register_status_notifier_host(host).await
+        {
+            debug!("Failed to register tray host {host}: {err}");
+        }
 
         // Subscribe before reading the list: an item registering in between is
         // then seen by at least one of the two, and duplicates are skipped.
@@ -606,6 +623,18 @@ impl TrayService {
                     Some(TrayEvent::Unregistered(name))
                 }
                 Some(event) = streams.events.next() => Some(event),
+                Some(owner) = owner_changed.next() => {
+                    info!("Tray watcher owner changed to {owner:?}, reloading items");
+                    if owner.is_none() {
+                        let _ = output
+                            .send(ServiceEvent::Init(TrayService {
+                                data: TrayData::default(),
+                                _conn: conn.clone(),
+                            }))
+                            .await;
+                    }
+                    return Ok(());
+                }
                 else => break,
             };
 
@@ -621,15 +650,39 @@ impl TrayService {
     async fn start_listening(state: State, output: &mut Sender<ServiceEvent<Self>>) -> State {
         match state {
             State::Init => match StatusNotifierWatcher::start_server().await {
-                Ok(conn) => State::Active { conn, failures: 0 },
+                Ok(conn) => {
+                    let host = format!("org.kde.StatusNotifierHost-{}", std::process::id());
+                    let host = match conn
+                        .request_name_with_flags(host.as_str(), RequestNameFlags::DoNotQueue.into())
+                        .await
+                    {
+                        Ok(_) => Some(host),
+                        Err(err) => {
+                            warn!("Failed to own {host}: {err}");
+                            None
+                        }
+                    };
+
+                    State::Active {
+                        conn,
+                        host,
+                        failures: 0,
+                    }
+                }
                 Err(err) => {
                     error!("Failed to connect to system bus: {err}");
 
                     State::Error
                 }
             },
-            State::Active { conn, mut failures } => {
-                if let Err(err) = TrayService::run_host(&conn, output, &mut failures).await {
+            State::Active {
+                conn,
+                host,
+                mut failures,
+            } => {
+                if let Err(err) =
+                    TrayService::run_host(&conn, host.as_deref(), output, &mut failures).await
+                {
                     let backoff = Duration::from_secs(1 << failures.min(5)).min(MAX_HOST_BACKOFF);
                     error!("Tray host failed: {err}, retrying in {backoff:?}");
 
@@ -637,7 +690,11 @@ impl TrayService {
                     failures += 1;
                 }
 
-                State::Active { conn, failures }
+                State::Active {
+                    conn,
+                    host,
+                    failures,
+                }
             }
             State::Error => {
                 error!("Tray service error");

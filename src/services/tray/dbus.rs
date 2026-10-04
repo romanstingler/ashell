@@ -54,13 +54,24 @@ impl StatusNotifierWatcher {
         let dbus_proxy = DBusProxy::new(&connection).await?;
         let name_owner_changed_stream = dbus_proxy.receive_name_owner_changed().await?;
 
-        let flags = RequestNameFlags::AllowReplacement | RequestNameFlags::ReplaceExisting;
-        if dbus_proxy.request_name(NAME, flags).await? == RequestNameReply::InQueue {
-            warn!("Bus name '{NAME}' already owned");
-        }
+        // Never take the name from a running watcher (another bar, KDE, a
+        // second ashell): queue for it instead and let the host side follow
+        // whoever owns it. The bus hands us the name when the owner leaves.
+        let owner = match dbus_proxy
+            .request_name(NAME, RequestNameFlags::AllowReplacement.into())
+            .await?
+        {
+            RequestNameReply::InQueue => {
+                info!("Another {NAME} is running, using it and waiting in line");
+                false
+            }
+            _ => true,
+        };
 
-        let emitter = SignalEmitter::new(&connection, OBJECT_PATH)?;
-        Self::status_notifier_host_registered(&emitter).await?;
+        if owner {
+            let emitter = SignalEmitter::new(&connection, OBJECT_PATH)?;
+            Self::status_notifier_host_registered(&emitter).await?;
+        }
 
         let internal_connection = connection.clone();
         let internal_interface = interface.clone();
@@ -82,6 +93,11 @@ impl StatusNotifierWatcher {
                             if args.new_owner.as_ref() == unique_name.as_ref() {
                                 info!("Acquired bus name: {NAME}");
                                 have_bus_name = true;
+                                // Items re-register on their own when the watcher
+                                // changes; this catches the ones that only own a name.
+                                if let Err(e) = Self::discover_items(&internal_connection, &internal_interface).await {
+                                    info!("Failed to discover tray items: {e}");
+                                }
                             } else if have_bus_name {
                                 info!("Lost bus name: {NAME}");
                                 have_bus_name = false;
@@ -115,7 +131,7 @@ impl StatusNotifierWatcher {
                             }
                         }
                     }
-                    _ = interval.tick() => {
+                    _ = interval.tick(), if have_bus_name => {
                         if let Err(e) = Self::discover_items(&internal_connection, &internal_interface).await {
                             info!("Failed to discover tray items: {e}");
                         }
@@ -123,11 +139,6 @@ impl StatusNotifierWatcher {
                 }
             }
         });
-
-        // Initial discovery
-        if let Err(e) = Self::discover_items(&connection, &interface).await {
-            info!("Failed initial tray item discovery: {e}");
-        }
 
         Ok(connection)
     }

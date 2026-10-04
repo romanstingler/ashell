@@ -8,6 +8,11 @@ This module provides a system tray for displaying icons of running applications.
 
 Clicking on an icon will open the corresponding application or menu. The module only appears when applications have tray icons.
 
+If another status bar or desktop component already provides the tray service
+(`org.kde.StatusNotifierWatcher`), ashell uses it instead of replacing it, and
+takes over when it exits. Several bars, or several ashell instances, then show
+the same icons.
+
 ## Blocklist
 
 You can filter which tray icons are displayed using the `blocklist` option. If a tray item's name matches any regex pattern in the blocklist, it won't be rendered.
