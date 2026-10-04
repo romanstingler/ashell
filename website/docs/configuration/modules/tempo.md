@@ -162,7 +162,11 @@ is a parse error that makes ashell fall back to the *entire* default config.
   `City`), or uses reverse geocoding from Nominatim (OpenStreetMap) to get location names for `Coordinates`.
 - Weather observations and forecasts are requested from the Open-Meteo API every 30 minutes. Ensure `ashell` has network
   access.
-- If an API call fails the module keeps showing the last successful reading and logs a warning.
+- A `City` is resolved once. `Current` is re-resolved before every weather request, and `Coordinates` looks up its place
+  name each time.
+- If an API call fails the module keeps showing the last successful reading and logs a warning. Failed attempts are retried
+  after 1 minute, then 2, 3 and so on, up to 30 minutes. If a location lookup fails, the weather request uses the last
+  coordinates that resolved.
 
 ## Screenshot protection
 

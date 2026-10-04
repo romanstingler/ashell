@@ -16,7 +16,7 @@ use log::{debug, trace, warn};
 use self::weather::{Location, WeatherData, fetch_location, fetch_weather_data};
 use crate::{
     components::MenuSize,
-    config::{TempoModuleConfig, WeatherIndicator},
+    config::{TempoModuleConfig, WeatherIndicator, WeatherLocation},
     i18n::{language_subtag, unit_system},
     theme::use_theme,
 };
@@ -264,23 +264,33 @@ impl Tempo {
                 let lang = lang.clone();
                 channel(100, async move |mut output| {
                     let mut failed_attempt: u64 = 0;
+                    // Last coordinates that resolved. A failed lookup keeps
+                    // them, so a geolocation outage does not stop the forecast.
+                    let mut coords: Option<(f32, f32)> = None;
 
                     loop {
-                        let loc = match fetch_location(&location, &lang).await {
-                            Ok(loc) => {
-                                debug!("Location fetched successfully");
-                                trace!("Location: {:?}", loc);
-                                let (lat, lon) = (loc.latitude, loc.longitude);
-                                output.send(Message::UpdateLocation(loc)).await.ok();
-                                Some((lat, lon))
-                            }
-                            Err(e) => {
-                                warn!("Failed to fetch location: {:?}", e);
-                                None
-                            }
-                        };
+                        // A `City` resolves to the same place for the whole
+                        // life of this subscription, so it is looked up once.
+                        // `Current` follows the network and `Coordinates` only
+                        // looks up a place name, so both run on every poll.
+                        let lookup =
+                            coords.is_none() || !matches!(location, WeatherLocation::City(_));
 
-                        if let Some((lat, lon)) = loc {
+                        if lookup {
+                            match fetch_location(&location, &lang).await {
+                                Ok(loc) => {
+                                    debug!("Location fetched successfully");
+                                    trace!("Location: {:?}", loc);
+                                    coords = Some((loc.latitude, loc.longitude));
+                                    output.send(Message::UpdateLocation(loc)).await.ok();
+                                }
+                                Err(e) => {
+                                    warn!("Failed to fetch location: {:?}", e);
+                                }
+                            }
+                        }
+
+                        if let Some((lat, lon)) = coords {
                             match fetch_weather_data(lat, lon, units, wind_unit).await {
                                 Ok(weather_data) => {
                                     failed_attempt = 0;
@@ -301,7 +311,8 @@ impl Tempo {
                         }
 
                         failed_attempt += 1;
-                        tokio::time::sleep(Duration::from_secs(60 * failed_attempt)).await;
+                        let delay = (60 * failed_attempt).min(60 * 30);
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
                     }
                 })
             })
