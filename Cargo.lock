@@ -152,6 +152,7 @@ dependencies = [
  "i18n-embed-fl",
  "iced_anim",
  "iced_layershell",
+ "image",
  "inotify",
  "itertools 0.15.0",
  "libc",

@@ -267,8 +267,27 @@ fn icon_from_path(path: PathBuf) -> Option<XdgIcon> {
     } else {
         debug!("raster icon found. Path: {path:?}");
 
-        Some(XdgIcon::Image(image::Handle::from_path(path)))
+        Some(XdgIcon::Image(decode_raster(&path).unwrap_or_else(|| {
+            debug!("raster icon {path:?}: not decodable here, leaving it to iced");
+            image::Handle::from_path(path)
+        })))
     }
+}
+
+/// iced decodes path handles on a worker and lays them out at zero width
+/// until then, with no relayout once the decode lands. RGBA handles load
+/// synchronously, so icons appear on the first frame.
+fn decode_raster(path: &Path) -> Option<image::Handle> {
+    let decoded = ::image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?
+        .into_rgba8();
+    let (width, height) = decoded.dimensions();
+
+    Some(image::Handle::from_rgba(width, height, decoded.into_raw()))
 }
 
 fn find_icon_path(icon_name: &str) -> Option<PathBuf> {
@@ -644,6 +663,23 @@ mod tests {
         assert!(get_icon_from_theme_path(&root, "missing").is_none());
         assert!(get_icon_from_theme_path(&root, "../tray").is_none());
         assert!(get_icon_from_theme_path(Path::new("relative"), "tray").is_none());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn decodable_png_becomes_rgba_handle() {
+        let root = std::env::temp_dir().join(format!("ashell-raster-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("tray.png");
+        ::image::RgbaImage::new(3, 2).save(&path).unwrap();
+
+        match get_icon_from_file(&path) {
+            Some(XdgIcon::Image(iced::widget::image::Handle::Rgba { width, height, .. })) => {
+                assert_eq!((width, height), (3, 2));
+            }
+            other => panic!("expected an RGBA handle, got {other:?}"),
+        }
 
         fs::remove_dir_all(&root).unwrap();
     }
