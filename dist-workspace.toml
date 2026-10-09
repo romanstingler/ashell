@@ -12,7 +12,7 @@ installers = ["shell"]
 # Whether CI should trigger releases with dispatches instead of tag pushes
 dispatch-releases = true
 # Checksums to generate for each App
-checksum = "false"
+checksum = "sha256"
 # Generate and dist a source tarball
 source-tarball = false
 # Which actions to run on pull requests

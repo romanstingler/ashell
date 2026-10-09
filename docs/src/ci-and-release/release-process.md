@@ -22,6 +22,7 @@ ashell uses [cargo-dist](https://github.com/axodotdev/cargo-dist) (v0.30.0) for 
    - Builds platform-specific artifacts (Linux binary + archives)
    - Builds global artifacts (shell installer)
    - Generates .deb and .rpm packages via `generate-installers.yml`, then installs each one in clean `ubuntu:24.04`, `debian:trixie` and `fedora:latest` containers and runs `ashell --version`. A package that fails to install blocks the release.
+   - Generates SHA-256 checksums: a `.sha256` file next to every artifact, plus a combined `sha256.sum` covering the dist artifacts (archive and shell installer, not the .deb/.rpm)
    - Uploads all artifacts to the GitHub Release
    - Un-drafts the release
 

@@ -26,8 +26,13 @@ jobs:
         run: |
           echo "$PLAN" > plan.json
 
-          # Extract artifact filenames and unique target triples
-          targets=$(jq -r '[.releases[].artifacts[] as $a | .artifacts[$a].target_triples[]] | unique | join(",")' plan.json)
+          # Extract unique target triples of the archives we package
+          # (checksum artifacts like sha256.sum have no target triples)
+          targets=$(jq -r '[.releases[].artifacts[] as $a | .artifacts[$a] | select(.kind == "executable-zip") | .target_triples[]] | unique | join(",")' plan.json)
+          if [ -z "$targets" ]; then
+            echo "No target triples found for any archive in the plan"
+            exit 1
+          fi
           echo "targets=$targets" >> "$GITHUB_OUTPUT"
 
       - name: Download built tarballs
@@ -112,6 +117,13 @@ jobs:
               ashell --version
             ' sh "$(basename "$rpm")"
             echo "::endgroup::"
+          done
+
+      - name: Generate checksums for packages
+        run: |
+          cd artifacts
+          for package in *.deb *.rpm; do
+            sha256sum "$package" > "$package.sha256"
           done
 
       - name: Upload generated installers
