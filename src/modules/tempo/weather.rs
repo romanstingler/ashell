@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::LazyLock, time::Duration};
 
 use chrono::{NaiveDate, NaiveDateTime};
 use iced::{
@@ -346,23 +346,43 @@ impl From<GeoLocation> for Location {
     }
 }
 
+/// Response of `https://ipwho.is/`. A failed lookup still answers with
+/// HTTP 200 and `success: false`, so the flag has to be checked.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IpLocation {
-    lat: f32,
-    lon: f32,
+struct IpLocation {
+    success: bool,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    latitude: Option<f32>,
+    #[serde(default)]
+    longitude: Option<f32>,
+    #[serde(default)]
     city: String,
-    region_name: String,
+    #[serde(default)]
+    region: String,
 }
 
-impl From<IpLocation> for Location {
-    fn from(value: IpLocation) -> Self {
-        Location {
-            latitude: value.lat,
-            longitude: value.lon,
-            city: value.city,
-            region_name: value.region_name,
+impl IpLocation {
+    fn into_location(self) -> anyhow::Result<Location> {
+        if !self.success {
+            anyhow::bail!(
+                "IP geolocation failed: {}",
+                self.message.as_deref().unwrap_or("unknown error")
+            );
         }
+
+        let (latitude, longitude) = self
+            .latitude
+            .zip(self.longitude)
+            .ok_or_else(|| anyhow::anyhow!("IP geolocation returned no coordinates"))?;
+
+        Ok(Location {
+            latitude,
+            longitude,
+            city: self.city,
+            region_name: self.region,
+        })
     }
 }
 
@@ -374,19 +394,68 @@ pub struct Location {
     pub region_name: String,
 }
 
-pub async fn fetch_location(location: &WeatherLocation, lang: &str) -> anyhow::Result<Location> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?;
+/// Upper bound for a response body, so a huge reply cannot exhaust memory.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+static HTTP_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(concat!(
+            "ashell/",
+            env!("CARGO_PKG_VERSION"),
+            " (+",
+            env!("CARGO_PKG_REPOSITORY"),
+            ")"
+        ))
+        .https_only(true)
+        .build()
+});
+
+/// Sends a GET request and returns the body, failing on a non-2xx status
+/// or an oversized body. Errors never carry the URL, whose query holds the
+/// user's coordinates or city.
+async fn get_text(url: reqwest::Url) -> anyhow::Result<String> {
+    let client = HTTP_CLIENT
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("failed to build the HTTP client: {e}"))?;
+
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("unexpected HTTP status {status}");
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            anyhow::bail!("response body exceeds {MAX_RESPONSE_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(String::from_utf8(body)?)
+}
+
+pub async fn fetch_location(location: &WeatherLocation, lang: &str) -> anyhow::Result<Location> {
     match location {
         WeatherLocation::City(city) => {
-            let url = format!(
-                "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language={}&format=json",
-                city, lang
-            );
-            let response = client.get(&url).send().await?;
-            let raw_data = response.text().await?;
+            let mut url = reqwest::Url::parse("https://geocoding-api.open-meteo.com/v1/search")?;
+            url.query_pairs_mut()
+                .append_pair("name", city)
+                .append_pair("count", "1")
+                .append_pair("language", lang)
+                .append_pair("format", "json");
+
+            let raw_data = get_text(url).await?;
 
             let data: GeoLocations = serde_json::from_str(&raw_data)?;
 
@@ -397,17 +466,14 @@ pub async fn fetch_location(location: &WeatherLocation, lang: &str) -> anyhow::R
                 .map(|l| l.into())
         }
         WeatherLocation::Current => {
-            let find_location = "http://ip-api.com/json/";
-
-            let response = client.get(find_location).send().await?;
-            let raw_data = response.text().await?;
+            let raw_data = get_text(reqwest::Url::parse("https://ipwho.is/")?).await?;
 
             let data: IpLocation = serde_json::from_str(&raw_data)?;
 
-            Ok(data.into())
+            data.into_location()
         }
         WeatherLocation::Coordinates(lat, lon) => {
-            let (city, region_name) = match try_reverse_geocode(&client, *lat, *lon, lang).await {
+            let (city, region_name) = match try_reverse_geocode(*lat, *lon, lang).await {
                 Ok(Some((city, region))) => (city, region),
                 _ => (format!("Lat: {}, Lon: {}", lat, lon), String::new()),
             };
@@ -423,56 +489,49 @@ pub async fn fetch_location(location: &WeatherLocation, lang: &str) -> anyhow::R
 }
 
 async fn try_reverse_geocode(
-    client: &reqwest::Client,
     lat: f32,
     lon: f32,
     lang: &str,
 ) -> anyhow::Result<Option<(String, String)>> {
-    let url = format!(
-        "https://nominatim.openstreetmap.org/reverse?format=json&lat={}&lon={}&accept-language={}",
-        lat, lon, lang
-    );
+    let mut url = reqwest::Url::parse("https://nominatim.openstreetmap.org/reverse")?;
+    url.query_pairs_mut()
+        .append_pair("format", "json")
+        .append_pair("lat", &lat.to_string())
+        .append_pair("lon", &lon.to_string())
+        .append_pair("accept-language", lang);
 
-    let response = client
-        .get(&url)
-        .header("User-Agent", "ashell")
-        .send()
-        .await?;
+    let raw_data = get_text(url).await?;
 
-    if response.status().is_success() {
-        let raw_data = response.text().await?;
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_data)
+        && let Some(address) = json.get("address")
+    {
+        let mut city = None;
 
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_data)
-            && let Some(address) = json.get("address")
+        if let Some(c) = address.get("city").and_then(|v| v.as_str()) {
+            city = Some(c);
+        } else if let Some(t) = address.get("town").and_then(|v| v.as_str()) {
+            city = Some(t);
+        } else if let Some(v) = address.get("village").and_then(|v| v.as_str()) {
+            city = Some(v);
+        } else if let Some(h) = address.get("hamlet").and_then(|v| v.as_str()) {
+            city = Some(h);
+        }
+
+        if let Some(country) = address.get("country").and_then(|v| v.as_str())
+            && let Some(city_name) = city
         {
-            let mut city = None;
+            return Ok(Some((
+                city_name.to_string(),
+                if city_name != country {
+                    country.to_string()
+                } else {
+                    String::new()
+                },
+            )));
+        }
 
-            if let Some(c) = address.get("city").and_then(|v| v.as_str()) {
-                city = Some(c);
-            } else if let Some(t) = address.get("town").and_then(|v| v.as_str()) {
-                city = Some(t);
-            } else if let Some(v) = address.get("village").and_then(|v| v.as_str()) {
-                city = Some(v);
-            } else if let Some(h) = address.get("hamlet").and_then(|v| v.as_str()) {
-                city = Some(h);
-            }
-
-            if let Some(country) = address.get("country").and_then(|v| v.as_str())
-                && let Some(city_name) = city
-            {
-                return Ok(Some((
-                    city_name.to_string(),
-                    if city_name != country {
-                        country.to_string()
-                    } else {
-                        String::new()
-                    },
-                )));
-            }
-
-            if let Some(city_name) = city {
-                return Ok(Some((city_name.to_string(), String::new())));
-            }
+        if let Some(city_name) = city {
+            return Ok(Some((city_name.to_string(), String::new())));
         }
     }
 
@@ -485,28 +544,31 @@ pub async fn fetch_weather_data(
     units: UnitSystem,
     wind_unit: crate::config::WindSpeedUnit,
 ) -> anyhow::Result<WeatherData> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?;
-
     let temp_param = match units {
         UnitSystem::Metric => "celsius",
         UnitSystem::Imperial => "fahrenheit",
     };
     let wind_param = wind_unit.api_param();
 
-    let response = client.get(format!(
-        "https://api.open-meteo.com/v1/forecast?\
-latitude={lat}&longitude={lon}\
-&current=weather_code,apparent_temperature,relative_humidity_2m,temperature_2m,is_day,wind_speed_10m,wind_direction_10m\
-&hourly=weather_code,temperature_2m,is_day\
-&daily=weather_code,temperature_2m_max,temperature_2m_min,wind_speed_10m_max,wind_direction_10m_dominant,relative_humidity_2m_mean\
-&forecast_days=7\
-&temperature_unit={temp_param}\
-&wind_speed_unit={wind_param}\
-&timezone=UTC"
-    )).send().await?;
-    let raw_data = response.text().await?;
+    let mut url = reqwest::Url::parse("https://api.open-meteo.com/v1/forecast")?;
+    url.query_pairs_mut()
+        .append_pair("latitude", &lat.to_string())
+        .append_pair("longitude", &lon.to_string())
+        .append_pair(
+            "current",
+            "weather_code,apparent_temperature,relative_humidity_2m,temperature_2m,is_day,wind_speed_10m,wind_direction_10m",
+        )
+        .append_pair("hourly", "weather_code,temperature_2m,is_day")
+        .append_pair(
+            "daily",
+            "weather_code,temperature_2m_max,temperature_2m_min,wind_speed_10m_max,wind_direction_10m_dominant,relative_humidity_2m_mean",
+        )
+        .append_pair("forecast_days", "7")
+        .append_pair("temperature_unit", temp_param)
+        .append_pair("wind_speed_unit", wind_param)
+        .append_pair("timezone", "UTC");
+
+    let raw_data = get_text(url).await?;
 
     let data: WeatherData = serde_json::from_str(&raw_data)?;
 
