@@ -186,6 +186,8 @@ fn lookup_icon(icon_name: &str) -> Option<IconFile> {
 }
 
 const THEME_PATH_MAX_DIRS: usize = 8;
+const THEME_PATH_MAX_DEPTH: usize = 4;
+const THEME_PATH_MAX_ENTRIES: usize = 2000;
 const ICON_FILE_EXTENSIONS: [&str; 2] = ["svg", "png"];
 
 fn has_icon_extension(path: &Path) -> bool {
@@ -202,6 +204,13 @@ fn is_plain_absolute(path: &Path) -> bool {
     path.is_absolute() && !path.components().any(|c| c == Component::ParentDir)
 }
 
+/// Pixel size encoded in an icon theme directory name (`22x22`, `48x48@2`).
+fn icon_dir_size(dir: &str) -> Option<u32> {
+    let (width, rest) = dir.split_once('x')?;
+    let height = rest.split('@').next()?;
+    (width == height).then(|| width.parse().ok()).flatten()
+}
+
 /// Icon from an absolute file path, which some SNI clients put in `IconName`.
 pub fn get_icon_from_file(path: &Path) -> Option<IconFile> {
     if !is_plain_absolute(path) || !has_icon_extension(path) || !path.is_file() {
@@ -212,8 +221,11 @@ pub fn get_icon_from_file(path: &Path) -> Option<IconFile> {
     Some(IconFile::from_path(path.to_path_buf()))
 }
 
-/// Looks `icon_name` up in the flat directories of an SNI `IconThemePath`
-/// (Chromium temp dirs, Spotify). Not cached: clients rewrite them.
+/// Looks `icon_name` up in an SNI `IconThemePath`. A flat `<dir>/<name>.svg`
+/// then `.png` is checked first, exactly as before. Only when no directory has
+/// a flat file does the bounded theme tree walk run
+/// (`hicolor/48x48/apps/...`). SVG wins, then the largest PNG; ties are broken
+/// by path. Not cached: clients rewrite these directories.
 pub fn get_icon_from_theme_path(theme_path: &str, icon_name: &str) -> Option<IconFile> {
     if theme_path.is_empty() {
         return None;
@@ -223,17 +235,91 @@ pub fn get_icon_from_theme_path(theme_path: &str, icon_name: &str) -> Option<Ico
         return None;
     }
 
-    let found = theme_path
+    let dirs: Vec<&Path> = theme_path
         .split(':')
         .map(Path::new)
-        .filter(|dir| dir.is_absolute() && !dir.components().any(|c| c == Component::ParentDir))
+        .filter(|dir| is_plain_absolute(dir))
         .take(THEME_PATH_MAX_DIRS)
-        .find_map(|dir| {
-            ["svg", "png"].iter().find_map(|ext| {
-                let path = dir.join(format!("{icon_name}.{ext}"));
-                path.is_file().then_some(path)
-            })
-        });
+        .collect();
+
+    // Flat dirs are the common case (Chromium temp dirs, Spotify): no walk.
+    let flat = dirs.iter().find_map(|dir| {
+        ICON_FILE_EXTENSIONS.iter().find_map(|ext| {
+            let path = dir.join(format!("{icon_name}.{ext}"));
+            path.is_file().then_some(path)
+        })
+    });
+    if let Some(path) = flat {
+        debug!("icon '{icon_name}': in theme path {theme_path:?}: {path:?}");
+        return Some(IconFile::from_path(path));
+    }
+
+    let mut best: Option<(u32, PathBuf)> = None;
+    let mut budget = THEME_PATH_MAX_ENTRIES;
+    for root in dirs {
+        if budget == 0 {
+            break;
+        }
+
+        let mut stack = vec![(root.to_path_buf(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                if budget == 0 {
+                    debug!("icon theme path {theme_path:?}: entry budget exhausted");
+                    break;
+                }
+                budget -= 1;
+
+                let path = entry.path();
+                // Symlinked directories are not followed, to keep the walk bounded.
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    if depth < THEME_PATH_MAX_DEPTH {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                }
+
+                if path.file_stem().and_then(|s| s.to_str()) != Some(icon_name)
+                    || !has_icon_extension(&path)
+                    || !path.is_file()
+                {
+                    continue;
+                }
+
+                let rank = if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
+                {
+                    u32::MAX
+                } else {
+                    path.strip_prefix(root)
+                        .ok()
+                        .and_then(|rel| {
+                            rel.components()
+                                .filter_map(|c| c.as_os_str().to_str().and_then(icon_dir_size))
+                                .max()
+                        })
+                        .unwrap_or(0)
+                };
+
+                let better = match best.as_ref() {
+                    None => true,
+                    Some((best_rank, best_path)) => {
+                        rank > *best_rank || (rank == *best_rank && path < *best_path)
+                    }
+                };
+                if better {
+                    best = Some((rank, path));
+                }
+            }
+        }
+    }
+
+    let found = best.map(|(_, path)| path);
     debug!("icon '{icon_name}': in theme path {theme_path:?}: {found:?}");
 
     found.map(IconFile::from_path)
@@ -557,9 +643,10 @@ fn icon_directories() -> Vec<PathBuf> {
 mod tests {
     use super::{
         IconFile, desktop_entry_keys, find_similar_icon, get_icon_from_file, get_icon_from_name,
-        is_safe_icon_name, normalize_icon_name, strip_icon_separators, theme_icon_path,
+        icon_dir_size, is_safe_icon_name, normalize_icon_name, strip_icon_separators,
+        theme_icon_path,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn desktop_entry_keys_skip_action_groups() {
@@ -710,6 +797,96 @@ mod tests {
         assert!(get_icon_from_file(&root.join("missing.png")).is_none());
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn theme_path_prefers_flat_files_before_the_tree() {
+        let root = std::env::temp_dir().join(format!("ashell-flat-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("hicolor/48x48/apps")).unwrap();
+        std::fs::create_dir_all(root.join("two")).unwrap();
+        std::fs::write(root.join("tray.png"), b"").unwrap();
+        std::fs::write(root.join("hicolor/48x48/apps/tray.png"), b"").unwrap();
+        std::fs::write(root.join("two/tray.svg"), b"").unwrap();
+
+        let in_path = |theme_path: &str| {
+            super::get_icon_from_theme_path(theme_path, "tray").map(|icon| match icon {
+                IconFile::Image(path) | IconFile::Svg(path) => path,
+            })
+        };
+
+        assert_eq!(in_path(root.to_str().unwrap()), Some(root.join("tray.png")));
+
+        // A flat file in any directory still wins over a tree in an earlier one.
+        let list = format!(
+            "{}:{}",
+            root.join("hicolor").display(),
+            root.join("two").display()
+        );
+        assert_eq!(in_path(&list), Some(root.join("two/tray.svg")));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn theme_path_finds_themed_subdirectories() {
+        let root = std::env::temp_dir().join(format!("ashell-theme-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["hicolor/22x22/apps", "hicolor/48x48/apps"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("hicolor/22x22/apps/tray.png"), b"").unwrap();
+        std::fs::write(root.join("hicolor/48x48/apps/tray.png"), b"").unwrap();
+        std::fs::write(root.join("hicolor/22x22/apps/only-small.png"), b"").unwrap();
+        std::fs::write(root.join("hicolor/48x48/apps/sym.svg"), b"").unwrap();
+
+        let in_path = |name| super::get_icon_from_theme_path(root.to_str().unwrap(), name);
+        let path = |icon: Option<IconFile>| match icon {
+            Some(IconFile::Image(path)) | Some(IconFile::Svg(path)) => path,
+            None => PathBuf::new(),
+        };
+
+        assert_eq!(
+            path(in_path("tray")),
+            root.join("hicolor/48x48/apps/tray.png")
+        );
+        assert_eq!(
+            path(in_path("only-small")),
+            root.join("hicolor/22x22/apps/only-small.png")
+        );
+        assert_eq!(
+            path(in_path("sym")),
+            root.join("hicolor/48x48/apps/sym.svg")
+        );
+        assert!(in_path("missing").is_none());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn theme_path_breaks_size_ties_by_path() {
+        let root = std::env::temp_dir().join(format!("ashell-theme-tie-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/22x22/apps")).unwrap();
+        std::fs::create_dir_all(root.join("b/22x22/apps")).unwrap();
+        std::fs::write(root.join("a/22x22/apps/tray.png"), b"").unwrap();
+        std::fs::write(root.join("b/22x22/apps/tray.png"), b"").unwrap();
+
+        let icon = super::get_icon_from_theme_path(root.to_str().unwrap(), "tray");
+        assert_eq!(
+            icon,
+            Some(super::IconFile::Image(root.join("a/22x22/apps/tray.png")))
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn icon_dir_size_reads_theme_directory_names() {
+        assert_eq!(icon_dir_size("22x22"), Some(22));
+        assert_eq!(icon_dir_size("48x48@2"), Some(48));
+        assert_eq!(icon_dir_size("scalable"), None);
+        assert_eq!(icon_dir_size("22x24"), None);
     }
 
     #[test]
