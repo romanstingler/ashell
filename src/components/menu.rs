@@ -35,8 +35,27 @@ pub enum MenuType {
 #[derive(Clone, Debug)]
 pub struct OpenMenu {
     pub id: SurfaceId,
+    /// Fullscreen click-catcher below the menu, so clicks outside the menu
+    /// still close it while the menu surface only accepts input on the menu
+    /// rectangle (leaving on-screen keyboards underneath it usable).
+    pub catcher_id: Option<SurfaceId>,
     pub menu_type: MenuType,
     pub button_ui_ref: ButtonUIRef,
+}
+
+impl MenuType {
+    pub fn is_tooltip(&self) -> bool {
+        matches!(
+            self,
+            MenuType::AudioTooltip
+                | MenuType::BluetoothTooltip
+                | MenuType::WifiTooltip
+                | MenuType::VpnTooltip
+                | MenuType::BatteryTooltip
+                | MenuType::PeripheralBatteryTooltip(_)
+                | MenuType::CustomTooltip(_)
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +96,10 @@ impl Menu {
         self.open.as_ref().map(|o| o.id)
     }
 
+    pub fn catcher_id(&self) -> Option<SurfaceId> {
+        self.open.as_ref().and_then(|o| o.catcher_id)
+    }
+
     pub fn is_open(&self) -> bool {
         self.open.is_some()
     }
@@ -101,6 +124,23 @@ impl Menu {
             KeyboardInteractivity::None
         };
 
+        // Fullscreen catcher on the top layer, below the overlay menu and any
+        // on-screen keyboard. It keeps click-outside working once the menu
+        // surface's input region is limited to the menu rectangle.
+        let catcher = if menu_type.is_tooltip() {
+            None
+        } else {
+            Some(new_layer_surface(LayerShellSettings {
+                namespace: "ashell-menu-catcher-layer".to_string(),
+                size: None,
+                layer: Layer::Top,
+                keyboard_interactivity: KeyboardInteractivity::None,
+                output: output_id,
+                anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                ..Default::default()
+            }))
+        };
+
         let (menu_id, task) = new_layer_surface(LayerShellSettings {
             namespace: "ashell-menu-layer".to_string(),
             size: None,
@@ -112,18 +152,30 @@ impl Menu {
         });
 
         // Destroy any surface still alive so reusing this slot never leaks a layer.
-        let destroy = self
-            .open
-            .take()
-            .map(|o| destroy_layer_surface(o.id))
-            .unwrap_or_else(Task::none);
+        let destroy = match self.open.take() {
+            Some(open) => {
+                let mut tasks = vec![destroy_layer_surface(open.id)];
+                if let Some(catcher_id) = open.catcher_id {
+                    tasks.push(destroy_layer_surface(catcher_id));
+                }
+                Task::batch(tasks)
+            }
+            None => Task::none(),
+        };
 
+        let catcher_id = catcher.as_ref().map(|(id, _)| *id);
         self.open = Some(OpenMenu {
             id: menu_id,
+            catcher_id,
             menu_type,
             button_ui_ref,
         });
-        Task::batch(vec![destroy, task])
+
+        let mut tasks = vec![destroy, task];
+        if let Some((_, catcher_task)) = catcher {
+            tasks.push(catcher_task);
+        }
+        Task::batch(tasks)
     }
 
     /// Begin the close animation, firing `FinishCloseMenu` once it ends.
@@ -164,7 +216,11 @@ impl Menu {
             );
         }
         if let Some(open) = self.open.take() {
-            destroy_layer_surface(open.id)
+            let mut tasks = vec![destroy_layer_surface(open.id)];
+            if let Some(catcher_id) = open.catcher_id {
+                tasks.push(destroy_layer_surface(catcher_id));
+            }
+            Task::batch(tasks)
         } else {
             Task::none()
         }
@@ -229,6 +285,18 @@ impl Menu {
                 ) && menu_is_tooltip =>
             {
                 Task::none()
+            }
+            // Tooltips and regular menus differ in whether they have a
+            // catcher and a limited input region, so recreate the surface when
+            // switching between them.
+            Some(open) if open.menu_type.is_tooltip() != menu_is_tooltip => {
+                self.pending_open = Some(PendingOpen {
+                    menu_type,
+                    button_ui_ref,
+                    request_keyboard,
+                    output_id,
+                });
+                self.close()
             }
             Some(open) => {
                 open.menu_type = menu_type;
@@ -334,7 +402,7 @@ impl App {
                 .into()
         };
 
-        components::MenuWrapper::new(button_ui_ref.position.x, menu_body)
+        let wrapper = components::MenuWrapper::new(button_ui_ref.position.x, menu_body)
             .padding({
                 let v_padding = match bar_surface {
                     BarSurface::Solid => 2,
@@ -360,7 +428,17 @@ impl App {
             .backdrop(backdrop_color(menu_backdrop))
             .on_click_outside(app::Message::CloseMenu(id))
             .open(!self.outputs.menu_is_closing(id))
-            .animated(use_theme(|t| t.animations_enabled))
-            .into()
+            .animated(use_theme(|t| t.animations_enabled));
+
+        // Tooltips keep the fullscreen surface (no catcher, no input region);
+        // regular menus publish their rectangle so the surface input region can
+        // follow it and leave the rest of the output to the compositor.
+        if self.outputs.menu_is_tooltip(id) {
+            wrapper.into()
+        } else {
+            wrapper
+                .on_bounds_changed(move |bounds| app::Message::MenuBoundsChanged(id, bounds))
+                .into()
+        }
     }
 }

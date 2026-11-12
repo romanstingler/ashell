@@ -28,10 +28,10 @@ use ashell_i18n::{Localizer, init_localizer};
 use flexi_logger::LoggerHandle;
 use iced::futures::StreamExt;
 use iced::{
-    Alignment, Element, Length, OutputEvent, Subscription, SurfaceId, Task, Theme,
+    Alignment, Element, InputRegionRect, Length, OutputEvent, Subscription, SurfaceId, Task, Theme,
     event::listen_with,
-    keyboard,
-    widget::{Row, blur_container, container, mouse_area},
+    keyboard, set_input_region,
+    widget::{Row, Space, blur_container, container, mouse_area},
 };
 use log::{debug, info, warn};
 use std::{collections::HashMap, path::PathBuf};
@@ -331,6 +331,15 @@ impl App {
                 self.outputs
                     .close_menu(id, None, self.general_config.enable_esc_key)
             }
+            Message::MenuBoundsChanged(id, bounds) => set_input_region(
+                id,
+                Some(vec![InputRegionRect {
+                    x: bounds.x as i32,
+                    y: bounds.y as i32,
+                    width: bounds.width as i32,
+                    height: bounds.height as i32,
+                }]),
+            ),
             Message::FinishCloseMenu(id) => self.outputs.finish_close_menu(id),
             Message::Custom(name, msg) => {
                 let Some(custom) = self.custom.get_mut(&name) else {
@@ -828,7 +837,15 @@ impl App {
                     ),
                 }
             }
-            Some(HasOutput::Menu(None)) | None => Row::new().into(),
+            Some(HasOutput::MenuCatcher(Some(open_menu))) => {
+                let menu_id = open_menu.id;
+                mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                    .on_release(Message::CloseMenu(menu_id))
+                    .into()
+            }
+            Some(HasOutput::Menu(None)) | Some(HasOutput::MenuCatcher(None)) | None => {
+                Row::new().into()
+            }
             Some(HasOutput::Toast) => self.notifications.toast_view().map(Message::Notifications),
             Some(HasOutput::Osd) => self.osd.view().map(Message::Osd),
         }

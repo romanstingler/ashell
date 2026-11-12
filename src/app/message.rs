@@ -5,7 +5,7 @@ use crate::{
     modules::{self, custom_module},
     osd,
 };
-use iced::{OutputEvent, SurfaceId};
+use iced::{OutputEvent, Rectangle, SurfaceId};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -13,6 +13,7 @@ pub enum Message {
     ConfigChanged(Box<Config>),
     ToggleMenu(MenuType, SurfaceId, ButtonUIRef),
     CloseMenu(SurfaceId),
+    MenuBoundsChanged(SurfaceId, Rectangle),
     FinishCloseMenu(SurfaceId),
     Custom(String, custom_module::Message),
     Updates(modules::updates::Message),

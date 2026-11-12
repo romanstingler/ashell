@@ -18,6 +18,8 @@ struct State {
     progress_anim: Animation<f32>,
     last_open: bool,
     initialized: bool,
+    last_bounds: Option<Rectangle>,
+    published_bounds: Option<Rectangle>,
 }
 
 #[allow(missing_debug_implementations)]
@@ -25,6 +27,7 @@ pub struct MenuWrapper<'a, Message, Theme = iced::Theme, Renderer = iced::Render
     x: f32,
     content: Element<'a, Message, Theme, Renderer>,
     on_click_outside: Option<Message>,
+    on_bounds_changed: Option<Box<dyn Fn(Rectangle) -> Message>>,
     padding: Padding,
     vertical_alignment: alignment::Vertical,
     backdrop: Option<Color>,
@@ -41,8 +44,9 @@ where
             x,
             content,
             on_click_outside: None,
-            vertical_alignment: alignment::Vertical::Top,
+            on_bounds_changed: None,
             padding: Padding::ZERO,
+            vertical_alignment: alignment::Vertical::Top,
             backdrop: None,
             open: true,
             animated: true,
@@ -61,6 +65,13 @@ where
 
     pub fn on_click_outside(mut self, message: Message) -> Self {
         self.on_click_outside = Some(message);
+        self
+    }
+
+    /// Publish the content bounds (the menu rectangle) whenever they change, so
+    /// the surface input region can follow the menu instead of the whole output.
+    pub fn on_bounds_changed(mut self, f: impl Fn(Rectangle) -> Message + 'static) -> Self {
+        self.on_bounds_changed = Some(Box::new(f));
         self
     }
 
@@ -99,6 +110,8 @@ where
             progress_anim: Animation::new(0.0),
             last_open: false,
             initialized: false,
+            last_bounds: None,
+            published_bounds: None,
         })
     }
 
@@ -150,6 +163,7 @@ where
         );
 
         let state = tree.state.downcast_mut::<State>();
+        state.last_bounds = node.children().first().map(|child| child.bounds());
         let now = Instant::now();
 
         if !self.animated {
@@ -221,6 +235,23 @@ where
             if state.progress_anim.is_animating(*now) {
                 shell.request_redraw();
                 shell.invalidate_layout();
+            }
+
+            match state.last_bounds {
+                // First frame: the bounds are only known after layout, so ask
+                // for one more frame to publish them.
+                None => {
+                    if self.on_bounds_changed.is_some() {
+                        shell.request_redraw();
+                    }
+                }
+                Some(bounds) if state.published_bounds != Some(bounds) => {
+                    state.published_bounds = Some(bounds);
+                    if let Some(on_bounds) = &self.on_bounds_changed {
+                        shell.publish(on_bounds(bounds));
+                    }
+                }
+                Some(_) => {}
             }
         }
 

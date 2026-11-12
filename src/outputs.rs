@@ -34,6 +34,9 @@ impl ShellInfo {
         if let Some(menu_id) = self.menu.surface_id() {
             tasks.push(destroy_layer_surface(menu_id));
         }
+        if let Some(catcher_id) = self.menu.catcher_id() {
+            tasks.push(destroy_layer_surface(catcher_id));
+        }
         Task::batch(tasks)
     }
 }
@@ -127,6 +130,7 @@ pub struct Outputs {
 pub enum HasOutput<'a> {
     Main,
     Menu(Option<&'a OpenMenu>),
+    MenuCatcher(Option<&'a OpenMenu>),
     Toast,
     Osd,
 }
@@ -136,7 +140,7 @@ impl HasOutput<'_> {
     pub fn surface(&self) -> config::Surface {
         match self {
             HasOutput::Main => config::Surface::Bar,
-            HasOutput::Menu(_) => config::Surface::Menu,
+            HasOutput::Menu(_) | HasOutput::MenuCatcher(_) => config::Surface::Menu,
             HasOutput::Toast => config::Surface::Notifications,
             HasOutput::Osd => config::Surface::Osd,
         }
@@ -289,6 +293,8 @@ impl Outputs {
             info.as_ref().and_then(|info| {
                 if info.id == id {
                     Some(HasOutput::Main)
+                } else if info.menu.catcher_id() == Some(id) {
+                    Some(HasOutput::MenuCatcher(info.menu.open.as_ref()))
                 } else if info.menu.surface_id() == Some(id) {
                     Some(HasOutput::Menu(info.menu.open.as_ref()))
                 } else {
@@ -618,9 +624,9 @@ impl Outputs {
         id: SurfaceId,
     ) -> Option<&(OutputKey, Option<ShellInfo>, Option<OutputId>)> {
         self.entries.iter().find(|(_, shell_info, _)| {
-            shell_info
-                .as_ref()
-                .is_some_and(|si| si.id == id || si.menu.surface_id() == Some(id))
+            shell_info.as_ref().is_some_and(|si| {
+                si.id == id || si.menu.surface_id() == Some(id) || si.menu.catcher_id() == Some(id)
+            })
         })
     }
 
@@ -629,9 +635,9 @@ impl Outputs {
         id: SurfaceId,
     ) -> Option<&mut (OutputKey, Option<ShellInfo>, Option<OutputId>)> {
         self.entries.iter_mut().find(|(_, shell_info, _)| {
-            shell_info
-                .as_ref()
-                .is_some_and(|si| si.id == id || si.menu.surface_id() == Some(id))
+            shell_info.as_ref().is_some_and(|si| {
+                si.id == id || si.menu.surface_id() == Some(id) || si.menu.catcher_id() == Some(id)
+            })
         })
     }
 
@@ -690,6 +696,20 @@ impl Outputs {
             shell_info
                 .as_ref()
                 .is_some_and(|si| si.menu.surface_id() == Some(id) && si.menu.is_closing())
+        })
+    }
+
+    /// True when the menu rendered on `id` is a hover tooltip.
+    pub fn menu_is_tooltip(&self, id: SurfaceId) -> bool {
+        self.entries.iter().any(|(_, shell_info, _)| {
+            shell_info.as_ref().is_some_and(|si| {
+                si.menu.surface_id() == Some(id)
+                    && si
+                        .menu
+                        .open
+                        .as_ref()
+                        .is_some_and(|open| open.menu_type.is_tooltip())
+            })
         })
     }
 
