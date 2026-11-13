@@ -67,6 +67,12 @@ settings-network-vpn = VPN
 settings-network-vpns-connected = Підключені VPN: { $count }
 settings-network-airplane-mode = Режим польоту
 settings-network-nearby-wifi = Wi-Fi поблизу
+settings-network-error-connect = Не вдалося підключитися до мережі
+settings-network-error-wifi = Не вдалося перемкнути Wi-Fi
+settings-network-error-airplane = Не вдалося перемкнути режим польоту
+settings-network-error-scan = Не вдалося виконати пошук Wi-Fi
+settings-network-error-vpn = Не вдалося перемкнути VPN
+settings-network-error-psk = Не вдалося прочитати пароль Wi-Fi
 
 ## Налаштування: Bluetooth
 settings-bluetooth = Bluetooth

@@ -72,6 +72,12 @@ settings-network-vpns-connected =
     }
 settings-network-airplane-mode = Режим полёта
 settings-network-nearby-wifi = Wi-Fi поблизости
+settings-network-error-connect = Не удалось подключиться к сети
+settings-network-error-wifi = Не удалось переключить Wi-Fi
+settings-network-error-airplane = Не удалось переключить режим полёта
+settings-network-error-scan = Не удалось выполнить поиск Wi-Fi
+settings-network-error-vpn = Не удалось переключить VPN
+settings-network-error-psk = Не удалось прочитать пароль Wi-Fi
 
 ## Настройки — Bluetooth
 settings-bluetooth = Bluetooth

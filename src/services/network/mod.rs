@@ -9,7 +9,7 @@ use iced::{
 };
 use iwd_dbus::IwdDbus;
 use log::{debug, error, info, warn};
-use std::{any::TypeId, ops::Deref, time::Duration};
+use std::{any::TypeId, future::Future, ops::Deref, time::Duration};
 use tokio::time::sleep;
 use zbus::{OwnedObjectPath, fdo::DBusProxy, names::BusName};
 
@@ -18,6 +18,9 @@ pub mod iwd_dbus;
 
 const NETWORK_MANAGER_NAME: &str = "org.freedesktop.NetworkManager";
 const IWD_NAME: &str = "net.connman.iwd";
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A value that is never printed by `Debug`.
 ///
@@ -110,6 +113,10 @@ pub enum NetworkEvent {
         ssid: String,
         outcome: PskOutcome,
     },
+    CommandFailed {
+        context: CommandContext,
+        message: String,
+    },
 }
 
 /// The `T:` field of a `WIFI:` URI. SAE stays distinct because WPA3-only
@@ -147,6 +154,29 @@ pub enum PskOutcome {
     Unsupported,
     /// Reading failed; the service logs the cause.
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandContext {
+    Connect,
+    ToggleWifi,
+    ToggleAirplane,
+    Scan,
+    ToggleVpn,
+    ReadPsk,
+}
+
+impl CommandContext {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::ToggleWifi => "toggle_wifi",
+            Self::ToggleAirplane => "toggle_airplane",
+            Self::Scan => "scan",
+            Self::ToggleVpn => "toggle_vpn",
+            Self::ReadPsk => "read_psk",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -383,6 +413,7 @@ impl ReadOnlyService for NetworkService {
             }
             NetworkEvent::RequestPasswordForSSID(_) => {}
             NetworkEvent::Psk { .. } => {}
+            NetworkEvent::CommandFailed { .. } => {}
         }
     }
 
@@ -467,6 +498,26 @@ async fn wait_for_backend(conn: &zbus::Connection) -> bool {
             else => return false,
         }
     }
+}
+
+async fn run_with_timeout<T>(
+    duration: Duration,
+    context: CommandContext,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(duration, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{} timed out after {duration:?}", context.as_str()))?
+}
+
+fn command_failed(
+    context: CommandContext,
+    error: impl std::fmt::Display,
+) -> ServiceEvent<NetworkService> {
+    ServiceEvent::Update(NetworkEvent::CommandFailed {
+        context,
+        message: error.to_string(),
+    })
 }
 
 struct BackendChoiceWithConnection {
@@ -751,65 +802,72 @@ impl Service for NetworkService {
 
                 Task::perform(
                     async move {
-                        debug!("Toggling airplane mode to: {}", !airplane_mode);
-                        let res = bc.set_airplane_mode(!airplane_mode).await;
-
-                        if res.is_ok() {
-                            !airplane_mode
-                        } else {
-                            airplane_mode
+                        let enabled = !airplane_mode;
+                        match run_with_timeout(
+                            COMMAND_TIMEOUT,
+                            CommandContext::ToggleAirplane,
+                            bc.set_airplane_mode(enabled),
+                        )
+                        .await
+                        {
+                            Ok(()) => ServiceEvent::Update(NetworkEvent::AirplaneMode(enabled)),
+                            Err(err) => command_failed(CommandContext::ToggleAirplane, err),
                         }
                     },
-                    |airplane_mode| ServiceEvent::Update(NetworkEvent::AirplaneMode(airplane_mode)),
+                    |event| event,
                 )
             }
-            NetworkCommand::SetAirplaneMode(enabled) => {
-                let previous = self.airplane_mode;
-
-                Task::perform(
-                    async move {
-                        debug!("Setting airplane mode to: {enabled}");
-                        let res = bc.set_airplane_mode(enabled).await;
-
-                        if res.is_ok() { enabled } else { previous }
-                    },
-                    |airplane_mode| ServiceEvent::Update(NetworkEvent::AirplaneMode(airplane_mode)),
-                )
-            }
+            NetworkCommand::SetAirplaneMode(enabled) => Task::perform(
+                async move {
+                    match run_with_timeout(
+                        COMMAND_TIMEOUT,
+                        CommandContext::ToggleAirplane,
+                        bc.set_airplane_mode(enabled),
+                    )
+                    .await
+                    {
+                        Ok(()) => ServiceEvent::Update(NetworkEvent::AirplaneMode(enabled)),
+                        Err(err) => command_failed(CommandContext::ToggleAirplane, err),
+                    }
+                },
+                |event| event,
+            ),
             NetworkCommand::ScanNearByWiFi => match self.backend_choice {
                 BackendChoice::NetworkManager => {
                     let conn = self.conn.clone();
                     Task::perform(
                         async move {
-                            match NetworkDbus::new(&conn).await {
-                                Ok(nm) => match nm.scan_nearby_wifi_with_devices().await {
-                                    Ok(device_paths) => device_paths,
-                                    Err(err) => {
-                                        error!(
-                                            "ScanNearByWiFi command: NetworkManager scan request failed: {err}"
-                                        );
-                                        Vec::new()
-                                    }
-                                },
-                                Err(err) => {
-                                    error!(
-                                        "ScanNearByWiFi command: Failed to create NetworkDbus: {err}"
-                                    );
-                                    Vec::new()
+                            let result =
+                                run_with_timeout(SCAN_TIMEOUT, CommandContext::Scan, async {
+                                    let nm = NetworkDbus::new(&conn).await?;
+                                    nm.scan_nearby_wifi_with_devices().await
+                                })
+                                .await;
+
+                            match result {
+                                Ok(device_paths) => {
+                                    ServiceEvent::Update(NetworkEvent::ScanRequested(device_paths))
                                 }
+                                Err(err) => command_failed(CommandContext::Scan, err),
                             }
                         },
-                        |device_paths| {
-                            ServiceEvent::Update(NetworkEvent::ScanRequested(device_paths))
-                        },
+                        |event| event,
                     )
                 }
                 BackendChoice::Iwd => Task::perform(
                     async move {
-                        let result = bc.scan_nearby_wifi().await;
-                        result.is_ok()
+                        match run_with_timeout(
+                            SCAN_TIMEOUT,
+                            CommandContext::Scan,
+                            bc.scan_nearby_wifi(),
+                        )
+                        .await
+                        {
+                            Ok(()) => ServiceEvent::Update(NetworkEvent::ScanningNearbyWifi(true)),
+                            Err(err) => command_failed(CommandContext::Scan, err),
+                        }
                     },
-                    |scanning| ServiceEvent::Update(NetworkEvent::ScanningNearbyWifi(scanning)),
+                    |event| event,
                 ),
             },
             NetworkCommand::ToggleWiFi => {
@@ -817,15 +875,19 @@ impl Service for NetworkService {
 
                 Task::perform(
                     async move {
-                        let res = bc.set_wifi_enabled(!wifi_enabled).await;
-
-                        if res.is_ok() {
-                            !wifi_enabled
-                        } else {
-                            wifi_enabled
+                        let enabled = !wifi_enabled;
+                        match run_with_timeout(
+                            COMMAND_TIMEOUT,
+                            CommandContext::ToggleWifi,
+                            bc.set_wifi_enabled(enabled),
+                        )
+                        .await
+                        {
+                            Ok(()) => ServiceEvent::Update(NetworkEvent::WiFiEnabled(enabled)),
+                            Err(err) => command_failed(CommandContext::ToggleWifi, err),
                         }
                     },
-                    |wifi_enabled| ServiceEvent::Update(NetworkEvent::WiFiEnabled(wifi_enabled)),
+                    |event| event,
                 )
             }
             NetworkCommand::SelectAccessPoint {
@@ -834,27 +896,37 @@ impl Service for NetworkService {
                 connect_once,
             } => Task::perform(
                 async move {
-                    if let Err(err) = bc
-                        .select_access_point(
+                    if let Err(err) = run_with_timeout(
+                        CONNECT_TIMEOUT,
+                        CommandContext::Connect,
+                        bc.select_access_point(
                             &access_point,
                             password.map(Redacted::into_inner),
                             connect_once,
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                     {
-                        error!(
-                            "SelectAccessPoint command: failed to activate '{}': {err}",
-                            access_point.ssid
-                        );
+                        return command_failed(CommandContext::Connect, err);
                     }
-                    bc.known_connections().await.unwrap_or_default()
+
+                    match run_with_timeout(
+                        COMMAND_TIMEOUT,
+                        CommandContext::Connect,
+                        bc.known_connections(),
+                    )
+                    .await
+                    {
+                        Ok(known_connections) => {
+                            ServiceEvent::Update(NetworkEvent::KnownConnections(known_connections))
+                        }
+                        Err(err) => command_failed(CommandContext::Connect, err),
+                    }
                 },
-                |known_connections| {
-                    ServiceEvent::Update(NetworkEvent::KnownConnections(known_connections))
-                },
+                |event| event,
             ),
             NetworkCommand::ToggleVpn(vpn) => {
-                let mut active_vpn = self.active_connections.iter().find_map(|kc| match kc {
+                let active_vpn = self.active_connections.iter().find_map(|kc| match kc {
                     ActiveConnectionInfo::Vpn { name, object_path } if name == &vpn.name => {
                         Some(object_path.clone())
                     }
@@ -863,19 +935,36 @@ impl Service for NetworkService {
 
                 Task::perform(
                     async move {
-                        let (object_path, new_state) = if let Some(active_vpn) = active_vpn.take() {
+                        let (object_path, new_state) = if let Some(active_vpn) = active_vpn {
                             (active_vpn, false)
                         } else {
                             (vpn.path, true)
                         };
-                        bc.set_vpn(object_path, new_state).await.unwrap_or_default();
-                        let res = bc.known_connections().await;
-                        debug!("VPN toggled: {res:?}");
-                        res.unwrap_or_default()
+
+                        if let Err(err) = run_with_timeout(
+                            COMMAND_TIMEOUT,
+                            CommandContext::ToggleVpn,
+                            bc.set_vpn(object_path, new_state),
+                        )
+                        .await
+                        {
+                            return command_failed(CommandContext::ToggleVpn, err);
+                        }
+
+                        match run_with_timeout(
+                            COMMAND_TIMEOUT,
+                            CommandContext::ToggleVpn,
+                            bc.known_connections(),
+                        )
+                        .await
+                        {
+                            Ok(known_connections) => ServiceEvent::Update(
+                                NetworkEvent::KnownConnections(known_connections),
+                            ),
+                            Err(err) => command_failed(CommandContext::ToggleVpn, err),
+                        }
                     },
-                    |known_connections| {
-                        ServiceEvent::Update(NetworkEvent::KnownConnections(known_connections))
-                    },
+                    |event| event,
                 )
             }
             NetworkCommand::ReadPsk(ssid) => match self.backend_choice {
@@ -884,8 +973,10 @@ impl Service for NetworkService {
                     Task::perform(
                         async move {
                             let result =
-                                async { NetworkDbus::new(&conn).await?.read_psk(&ssid).await }
-                                    .await;
+                                run_with_timeout(COMMAND_TIMEOUT, CommandContext::ReadPsk, async {
+                                    NetworkDbus::new(&conn).await?.read_psk(&ssid).await
+                                })
+                                .await;
 
                             let outcome = match result {
                                 Ok(outcome) => outcome,

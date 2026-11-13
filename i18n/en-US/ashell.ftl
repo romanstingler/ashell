@@ -70,6 +70,12 @@ settings-network-vpns-connected =
     }
 settings-network-airplane-mode = Airplane Mode
 settings-network-nearby-wifi = Nearby Wifi
+settings-network-error-connect = Could not connect to the network
+settings-network-error-wifi = Could not toggle Wi-Fi
+settings-network-error-airplane = Could not toggle airplane mode
+settings-network-error-scan = Could not scan for Wi-Fi
+settings-network-error-vpn = Could not toggle VPN
+settings-network-error-psk = Could not read the Wi-Fi password
 
 ## Settings — bluetooth
 settings-bluetooth = Bluetooth

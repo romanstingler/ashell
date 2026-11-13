@@ -70,6 +70,12 @@ settings-network-vpns-connected =
     }
 settings-network-airplane-mode = Mode avion
 settings-network-nearby-wifi = Wi-Fi à proximité
+settings-network-error-connect = Impossible de se connecter au réseau
+settings-network-error-wifi = Impossible de basculer le Wi-Fi
+settings-network-error-airplane = Impossible de basculer le mode avion
+settings-network-error-scan = Impossible de rechercher des réseaux Wi-Fi
+settings-network-error-vpn = Impossible de basculer le VPN
+settings-network-error-psk = Impossible de lire le mot de passe Wi-Fi
 
 ## Paramètres — Bluetooth
 settings-bluetooth = Bluetooth

@@ -11,8 +11,9 @@ use crate::{
     services::{
         ReadOnlyService, Service, ServiceEvent,
         network::{
-            AccessPointData, ActiveConnectionInfo, KnownConnection, NetworkCommand, NetworkEvent,
-            NetworkService, PskOutcome, Redacted, Vpn, dbus::ConnectivityState, frequency_band,
+            AccessPointData, ActiveConnectionInfo, CommandContext, KnownConnection, NetworkCommand,
+            NetworkEvent, NetworkService, PskOutcome, Redacted, Vpn, dbus::ConnectivityState,
+            frequency_band,
         },
     },
     theme::use_theme,
@@ -145,10 +146,22 @@ impl NetworkSettingsConfig {
     }
 }
 
+fn command_error_text(context: CommandContext) -> String {
+    match context {
+        CommandContext::Connect => t!("settings-network-error-connect").to_string(),
+        CommandContext::ToggleWifi => t!("settings-network-error-wifi").to_string(),
+        CommandContext::ToggleAirplane => t!("settings-network-error-airplane").to_string(),
+        CommandContext::Scan => t!("settings-network-error-scan").to_string(),
+        CommandContext::ToggleVpn => t!("settings-network-error-vpn").to_string(),
+        CommandContext::ReadPsk => t!("settings-network-error-psk").to_string(),
+    }
+}
+
 pub struct NetworkSettings {
     config: NetworkSettingsConfig,
     service: Option<NetworkService>,
     share_in_flight: bool,
+    command_error: Option<String>,
 }
 
 impl NetworkSettings {
@@ -157,6 +170,7 @@ impl NetworkSettings {
             config,
             share_in_flight: false,
             service: None,
+            command_error: None,
         }
     }
 
@@ -172,12 +186,27 @@ impl NetworkSettings {
     }
 
     pub fn update(&mut self, message: Message) -> Action {
+        if matches!(
+            &message,
+            Message::ToggleAirplaneMode
+                | Message::SetAirplaneMode(_)
+                | Message::ToggleWiFi
+                | Message::ScanNearByWiFi
+                | Message::SelectAccessPoint(_)
+                | Message::ConfirmOpenNetwork(_)
+                | Message::ToggleVpn(_)
+                | Message::ShareActiveWifi
+        ) {
+            self.command_error = None;
+        }
+
         match message {
             Message::Event(_) if self.config.backend == NetworkBackend::Disabled => Action::None,
             Message::Event(event) => match event {
                 ServiceEvent::Init(service) => {
                     self.service = Some(service);
                     self.share_in_flight = false;
+                    self.command_error = None;
                     Action::None
                 }
                 ServiceEvent::Update(NetworkEvent::RequestPasswordForSSID(ssid)) => {
@@ -197,6 +226,12 @@ impl NetworkSettings {
                                 Action::None
                             }
                         }
+                    }
+                    NetworkEvent::CommandFailed { context, message } => {
+                        warn!("Network command failed ({}): {message}", context.as_str());
+                        self.share_in_flight = false;
+                        self.command_error = Some(command_error_text(context));
+                        Action::None
                     }
                     other => {
                         if let Some(service) = self.service.as_mut() {
@@ -360,6 +395,7 @@ impl NetworkSettings {
             Message::ConfigReloaded(config) => {
                 let disabled = config.backend == NetworkBackend::Disabled;
                 self.config = config;
+                self.command_error = None;
                 if disabled {
                     self.service = None;
                 }
@@ -499,6 +535,7 @@ impl NetworkSettings {
                             self.config.wifi_more_cmd.is_some(),
                             self.share_in_flight,
                             service.is_network_manager(),
+                            self.command_error.as_deref(),
                         ),
                     )),
                 ))
@@ -574,7 +611,12 @@ impl NetworkSettings {
                         ),
                         Some((
                             sub_menu == Some(SubMenu::Vpn),
-                            Self::vpn_menu(service, id, self.config.vpn_more_cmd.is_some()),
+                            Self::vpn_menu(
+                                service,
+                                id,
+                                self.config.vpn_more_cmd.is_some(),
+                                self.command_error.as_deref(),
+                            ),
                         )),
                     )
                 })
@@ -613,10 +655,11 @@ impl NetworkSettings {
         show_more_button: bool,
         share_in_flight: bool,
         can_share_wifi: bool,
+        command_error: Option<&'a str>,
     ) -> Element<'a, Message> {
         let (space, font_size, animated) =
             use_theme(|t| (t.space, t.font_size, t.animations_enabled));
-        let main = column!(
+        let mut main = column!(
             row!(
                 text(t!("settings-network-nearby-wifi")).width(Length::Fill),
                 text(if service.scanning_nearby_wifi {
@@ -640,7 +683,19 @@ impl NetworkSettings {
             .width(Length::Fill)
             .align_y(Alignment::Center),
             divider(),
-            container(scrollable(
+        );
+
+        if let Some(error) = command_error {
+            main = main.push(
+                text(error)
+                    .size(font_size.xs)
+                    .style(|theme: &Theme| text::Style {
+                        color: Some(theme.palette().warning),
+                    }),
+            );
+        }
+
+        let main = main.push(container(scrollable(
                 Column::with_children({
                     let (active_networks, inactive_networks): (Vec<_>, Vec<_>) = service
                         .wireless_access_points
@@ -727,9 +782,8 @@ impl NetworkSettings {
                 })
                 .spacing(space.xxs)
             ).spacing(space.xs))
-            .max_height(200),
-        )
-        .spacing(space.xs);
+            .max_height(200))
+            .spacing(space.xs);
 
         if show_more_button {
             column!(
@@ -750,8 +804,9 @@ impl NetworkSettings {
         service: &'a NetworkService,
         id: SurfaceId,
         show_more_button: bool,
+        command_error: Option<&'a str>,
     ) -> Element<'a, Message> {
-        let space = use_theme(|t| t.space);
+        let (space, font_size) = use_theme(|t| (t.space, t.font_size));
         // Create HashSet of active VPN names for O(1) lookup
         let active_vpn_names: std::collections::HashSet<&str> = service
             .active_connections
@@ -793,9 +848,23 @@ impl NetworkSettings {
         .spacing(space.xs)
         .padding(Padding::default().right(space.md).left(space.xs));
 
-        let main = container(scrollable(vpn_list))
-            .height(Length::Shrink)
-            .max_height(300);
+        let mut main = column!();
+        if let Some(error) = command_error {
+            main = main.push(
+                text(error)
+                    .size(font_size.xs)
+                    .style(|theme: &Theme| text::Style {
+                        color: Some(theme.palette().warning),
+                    }),
+            );
+        }
+        let main = main
+            .push(
+                container(scrollable(vpn_list))
+                    .height(Length::Shrink)
+                    .max_height(300),
+            )
+            .spacing(space.xs);
 
         if show_more_button {
             column!(

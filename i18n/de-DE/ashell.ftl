@@ -71,6 +71,12 @@ settings-network-vpns-connected =
     }
 settings-network-airplane-mode = Flugmodus
 settings-network-nearby-wifi = Verfügbare WLANs
+settings-network-error-connect = Verbindung mit dem Netzwerk fehlgeschlagen
+settings-network-error-wifi = WLAN konnte nicht umgeschaltet werden
+settings-network-error-airplane = Flugmodus konnte nicht umgeschaltet werden
+settings-network-error-scan = WLAN-Suche konnte nicht gestartet werden
+settings-network-error-vpn = VPN konnte nicht umgeschaltet werden
+settings-network-error-psk = WLAN-Passwort konnte nicht gelesen werden
 
 ## Einstellungen — Bluetooth
 settings-bluetooth = Bluetooth
